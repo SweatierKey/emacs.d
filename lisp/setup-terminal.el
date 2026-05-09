@@ -235,5 +235,80 @@ When the host changes, recompute the desired tab title (in the form
 (with-eval-after-load 'vterm
   (advice-add 'vterm--filter :after #'emacs.d/vterm-update-current-host))
 
+;; ---------------------------------------------------------------------------
+;; Closing sessions: `q' on a dead session, auto-close empty tab
+;; ---------------------------------------------------------------------------
+;;
+;; Two related conveniences for the SSH workflow:
+;;
+;;   * After the remote shell exits (you typed `exit', SSH dropped, or
+;;     CyberArk PSMP timed you out), the vterm buffer is left around so
+;;     you can read the last lines of output.  We *don't* want to kill
+;;     it automatically -- those last lines often contain the error
+;;     that explains why the connection died.  But once you've read
+;;     them, you should be able to dismiss the buffer with a single
+;;     keystroke instead of `M-x kill-buffer'.  We hook into vterm's
+;;     `vterm-exit-functions' to install a `q' -> `kill-current-buffer'
+;;     binding the moment the process exits, plus a visible "[exited]"
+;;     marker in the mode line so you know the session is dead.
+;;
+;;   * When you kill a session buffer (via `q' or `kill-buffer'), the
+;;     tab that hosted it should disappear with it -- otherwise you'd
+;;     end up with a parade of orphan tabs each pointing at *scratch*.
+;;     A buffer-local `kill-buffer-hook' installed by
+;;     `setup-ssh-sessions' takes care of that, looking up the tab by
+;;     its recorded `emacs.d/vterm-tab-name' so it works even if you
+;;     killed the buffer from a different tab.
+
+(defun emacs.d/vterm-handle-exit (buf _event)
+  "Run from `vterm-exit-functions' when the vterm process in BUF dies.
+
+Installs a minimal local keymap on top of the existing one that binds
+`q' to `kill-current-buffer', so the user can dismiss the dead session
+with a single keystroke.  Also drops a \"[exited]\" indicator in the
+mode line so the buffer is visibly recognisable as inert."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (let ((map (make-sparse-keymap)))
+        ;; Inherit from whatever keymap was active so familiar bindings
+        ;; like scrolling and copy keep working.  We only add `q' on
+        ;; top.
+        (set-keymap-parent map (current-local-map))
+        (define-key map (kbd "q") #'kill-current-buffer)
+        (use-local-map map))
+      (setq-local mode-line-process
+                  (propertize " [exited]" 'face 'shadow))
+      (force-mode-line-update))))
+
+(with-eval-after-load 'vterm
+  (add-hook 'vterm-exit-functions #'emacs.d/vterm-handle-exit))
+
+(defun emacs.d/vterm-close-tab-on-kill ()
+  "Close the tab that hosts the current vterm buffer, when the buffer
+is being killed.  Installed buffer-locally by `setup-ssh-sessions' on
+the vterm buffers it creates, so general (manually-launched) vterms
+keep the default Emacs behaviour of *not* closing the tab.
+
+The tab is identified by name (recorded in
+`emacs.d/vterm-tab-name'), so this works even when the user is looking
+at a different tab at the moment of the kill.
+
+We refuse to close the very last tab on the frame -- Emacs would
+signal an error, and the user almost certainly wants to keep the
+frame alive."
+  (when (and (bound-and-true-p tab-bar-mode)
+             emacs.d/vterm-tab-name)
+    (let* ((tabs (funcall tab-bar-tabs-function))
+           (idx  (cl-position emacs.d/vterm-tab-name tabs
+                              :key  (lambda (tab) (alist-get 'name tab))
+                              :test #'string-equal)))
+      (when (and idx (> (length tabs) 1))
+        ;; Defer the close to the next idle tick.  Calling
+        ;; `tab-bar-close-tab' from inside `kill-buffer-hook' is
+        ;; supported but can leave the window manager in a transient
+        ;; state where buffer-list traversal misbehaves; running the
+        ;; close after the kill has settled is more robust.
+        (run-at-time 0 nil #'tab-bar-close-tab (1+ idx))))))
+
 (provide 'setup-terminal)
 ;;; setup-terminal.el ends here

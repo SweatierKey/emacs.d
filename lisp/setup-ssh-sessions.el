@@ -196,10 +196,15 @@ description -- so you can search by any of them with Orderless."
       (vterm vterm-buffer-name))
 
     ;; Mark the freshly-created vterm buffer with metadata used by
-    ;; `setup-terminal' to keep the tab title in sync with the prompt.
+    ;; `setup-terminal' to keep the tab title in sync with the prompt,
+    ;; and arm the auto-close-tab-on-kill hook *just* for this buffer
+    ;; so casually-launched vterms (e.g. via `C-c v') keep the default
+    ;; "leave the tab open" behaviour.
     (with-current-buffer (current-buffer)
       (setq-local emacs.d/vterm-bastion-name name
-                  emacs.d/vterm-tab-name     name))
+                  emacs.d/vterm-tab-name     name)
+      (add-hook 'kill-buffer-hook
+                #'emacs.d/vterm-close-tab-on-kill nil t))
 
     (force-mode-line-update t)))
 
