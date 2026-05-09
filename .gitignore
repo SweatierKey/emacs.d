@@ -1,0 +1,52 @@
+# --- Installed packages and compilation cache ------------------------------
+elpa/
+eln-cache/
+
+# --- Generated state -------------------------------------------------------
+# Backups, auto-saves and TRAMP persistency live under var/.
+var/
+auto-save-list/
+tramp
+tramp~
+.tramp_history
+
+# --- Customize -------------------------------------------------------------
+# Per-machine settings written by `customize-*' commands.  Not portable,
+# so we keep it out of version control.
+custom.el
+
+# --- Emacs editor noise ----------------------------------------------------
+# Backup files Emacs writes next to source files (we redirect them under
+# var/ at runtime, but a stray one might still appear in odd cases).
+*~
+\#*\#
+.\#*
+
+# --- Native-compilation logs -----------------------------------------------
+*.eln
+
+# --- Tutorial bookmark file (generated when you run the tutorial) ----------
+tutorial/
+
+# --- Per-mode local state --------------------------------------------------
+eshell/
+projects
+bookmarks
+recentf
+history
+places
+network-security.data
+url/
+transient/
+
+# --- Editor-of-editor swap files (vim, JetBrains, ...) ---------------------
+.idea/
+.vscode/
+
+# --- OS noise --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# --- Local-only init backups -----------------------------------------------
+init.el.bak
+init.el~

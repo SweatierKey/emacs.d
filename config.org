@@ -1,0 +1,1226 @@
+#+TITLE:      Emacs Configuration
+#+AUTHOR:     Matteo (SweatierKey)
+#+STARTUP:    overview
+#+PROPERTY:   header-args:emacs-lisp :results silent :mkdirp yes :comments no
+
+* About this file
+:PROPERTIES:
+:CUSTOM_ID: about
+:END:
+
+This is a /literate/ Emacs configuration: prose and source code live
+together in a single ~config.org~ file, and Org Babel /tangles/ each
+~src~ block out into the corresponding ~.el~ file under ~lisp/~.
+
+The benefit is that you only have to read one document to learn the
+whole configuration -- every package and every option comes with its
+rationale right next to it.
+
+** How the workflow works
+:PROPERTIES:
+:CUSTOM_ID: workflow
+:END:
+
+There are two equivalent entry points:
+
+1. Edit ~config.org~.  When you save it, the ~after-save-hook~ in
+   [[*Editor basics][Editor basics]] re-tangles the file in place: every ~src~ block is
+   written back to the ~.el~ file declared in its ~:tangle~ header.
+2. Edit a ~lisp/setup-*.el~ file directly.  Convenient for quick tweaks,
+   but the prose in ~config.org~ will drift out of sync over time.  The
+   long-term-friendly habit is to make non-trivial changes through the
+   ~.org~ file.
+
+** First-run on a new machine
+:PROPERTIES:
+:CUSTOM_ID: first-run
+:END:
+
+If you cloned this repository on a fresh machine, just open Emacs.  The
+~init.el~ bootstrap will:
+
+1. add ~lisp/~ to ~load-path~,
+2. set up the package archives,
+3. ~require~ each module in order.
+
+Missing packages are downloaded automatically by ~use-package~ on first
+start.  Language servers (for [[*Programming language support][Programming language support]]) must be
+installed manually -- see the cheat sheet there.
+
+** What lives where
+:PROPERTIES:
+:CUSTOM_ID: layout
+:END:
+
+#+begin_example
+.emacs.d/
+├── early-init.el       Pre-init tweaks (GC, file handlers, UI flicker)
+├── init.el             Bootstrap: package, use-package, require modules
+├── config.org          THIS FILE (single source of truth, tangles to lisp/)
+├── lisp/
+│   ├── setup-memory.el      GC + memory tuning
+│   ├── setup-ui.el          Theme, font, scrolling, line numbers
+│   ├── setup-editor.el      Built-in editing tweaks + auto-tangle hook
+│   ├── setup-completion.el  vertico, marginalia, orderless, consult, corfu
+│   ├── setup-prog.el        eglot, flymake, eldoc, treesit, shellcheck
+│   ├── setup-magit.el       Git porcelain
+│   └── setup-tramp.el       Remote editing over SSH
+├── var/                Generated state: backups, auto-saves, tramp cache
+├── elpa/               Installed packages (gitignored)
+└── eln-cache/          Native-comp cache (gitignored)
+#+end_example
+
+* early-init.el                                                   :EARLY:
+:PROPERTIES:
+:CUSTOM_ID: early-init
+:END:
+
+The early-init file runs /before/ ~package.el~ is initialised and
+/before/ any frame is painted.  Its job is intentionally tiny:
+
+1. raise the GC threshold for the duration of init,
+2. neutralise ~file-name-handler-alist~ during init (avoids walking
+   TRAMP / archive / image handlers for every plain Lisp file we read),
+3. hide the toolbar / menubar / scrollbar before they paint, and tell
+   ~package.el~ that we will activate it ourselves later.
+
+The full source lives in [[file:early-init.el][early-init.el]].  We do *not* tangle it from
+this org file, because early-init has to exist on disk before Org has
+even loaded.
+
+* Init bootstrap
+:PROPERTIES:
+:CUSTOM_ID: init-bootstrap
+:END:
+
+The top-level ~init.el~ stays small: it adds ~lisp/~ to ~load-path~,
+sets up the custom file, configures the package archives, and
+~require~'s every module in the right order.  An ~emacs.d/maybe-tangle-config~
+helper detects when ~config.org~ is newer than the modules in ~lisp/~
+and re-tangles automatically -- this means you can edit ~config.org~,
+restart Emacs, and the changes pick up without ever running anything by
+hand.
+
+The full source lives in [[file:init.el][init.el]].
+
+* Memory and GC                                                  :MEMORY:
+:PROPERTIES:
+:CUSTOM_ID: memory
+:END:
+
+Emacs feels snappy when the garbage collector is invisible.  The default
+threshold (~800 KiB) is so low that the GC fires whenever you press a
+key.  We do three things:
+
+1. install [[https://gitlab.com/koral/gcmh][gcmh]], which raises the threshold while you are typing and
+   lowers it during idle time,
+2. raise ~read-process-output-max~ so LSP servers can deliver large
+   responses in one read instead of many,
+3. raise the ~undo-*~ and ~history-*~ limits to numbers that match what
+   modern hardware can comfortably hold.
+
+#+begin_src emacs-lisp :tangle lisp/setup-memory.el
+;;; setup-memory.el --- GC and memory tuning -*- lexical-binding: t; -*-
+
+;; The goal of this module is to make Emacs feel snappy without burning
+;; through RAM unnecessarily.  It does three things:
+;;
+;;   1. installs `gcmh-mode', which raises the GC threshold while you are
+;;      *busy* (typing, scrolling, running commands) and lowers it during
+;;      idle time -- exactly the opposite of the default behaviour, which
+;;      tends to GC right when you press a key;
+;;
+;;   2. raises `read-process-output-max', the size of the buffer Emacs uses
+;;      to slurp data coming back from subprocesses.  The default of 4 KiB
+;;      is too small for LSP servers (Eglot, lsp-mode) that exchange
+;;      hundreds of KiB of JSON per response and end up doing many tiny
+;;      reads, each of which triggers redisplay;
+;;
+;;   3. tweaks a few built-in limits (history sizes, large-file warning
+;;      thresholds, undo limits) for a less stuttery experience on modern
+;;      hardware where 100 MiB of RAM is no longer a meaningful concern.
+
+;;; Code:
+
+;; ---------------------------------------------------------------------------
+;; gcmh -- "garbage collector magic hack"
+;; ---------------------------------------------------------------------------
+;;
+;; Tiny package (single file) that hooks into idle and busy events so the GC
+;; only runs when it won't be felt by the user.  Defaults are sensible; we
+;; only nudge the high threshold up a touch (16 MiB instead of the package
+;; default 1 GiB which is overkill).
+(use-package gcmh
+  :diminish gcmh-mode
+  :init
+  (setq gcmh-idle-delay        'auto         ;; let gcmh figure it out
+        gcmh-auto-idle-delay-factor 10
+        gcmh-high-cons-threshold (* 16 1024 1024))
+  :hook (emacs-startup . gcmh-mode))
+
+;; ---------------------------------------------------------------------------
+;; Subprocess I/O buffer
+;; ---------------------------------------------------------------------------
+;;
+;; LSP servers communicate over stdio with potentially large JSON payloads.
+;; A larger pipe buffer means fewer round-trips through the redisplay loop
+;; and noticeably smoother completion / hover.
+;;
+;; 1 MiB is the value the LSP-mode and Eglot manuals recommend.  Going
+;; higher rarely helps; going lower hurts.
+(setq read-process-output-max (* 1024 1024))
+
+;; By default `process-adaptive-read-buffering' adds latency to make slow
+;; processes feel "smooth".  For LSP that's the wrong trade-off -- we want
+;; the data as fast as possible.
+(setq process-adaptive-read-buffering nil)
+
+;; ---------------------------------------------------------------------------
+;; History sizes
+;; ---------------------------------------------------------------------------
+;;
+;; Most of these defaults date back to the 1990s and assume RAM is precious.
+;; We're more generous: longer histories make `consult-history' and
+;; `recentf' actually useful.
+(setq history-length            1000
+      history-delete-duplicates t
+      kill-ring-max             300
+      mark-ring-max             50
+      global-mark-ring-max      50)
+
+;; ---------------------------------------------------------------------------
+;; Undo
+;; ---------------------------------------------------------------------------
+;;
+;; The defaults silently truncate the undo history of files larger than
+;; ~150 KiB, which is annoying when editing JSON/log/code-generated files.
+;; Bumping the limits costs a few MiB at most.
+(setq undo-limit          (* 4 1024 1024)        ;; soft cap before truncating
+      undo-strong-limit   (* 6 1024 1024)        ;; hard cap
+      undo-outer-limit    (* 64 1024 1024))      ;; per-command outer cap
+
+;; ---------------------------------------------------------------------------
+;; Large file warnings
+;; ---------------------------------------------------------------------------
+;;
+;; Default is 10 MiB which trips on perfectly normal log files.  We bump it
+;; to 100 MiB; anything larger really *should* prompt before opening because
+;; font-lock and undo will choke.
+(setq large-file-warning-threshold (* 100 1024 1024))
+
+(provide 'setup-memory)
+;;; setup-memory.el ends here
+#+end_src
+
+* Look and feel                                                      :UI:
+:PROPERTIES:
+:CUSTOM_ID: ui
+:END:
+
+Visual choices: a dark theme inherited from the previous configuration,
+a display font with sensible fallbacks, line numbers in code buffers,
+smooth scrolling.
+
+** Theme
+:PROPERTIES:
+:CUSTOM_ID: theme
+:END:
+
+[[https://github.com/rexim/gruber-darker-theme][gruber-darker]] -- muted, low-saturation, easy on the eyes for long
+sessions.
+
+** Font
+:PROPERTIES:
+:CUSTOM_ID: font
+:END:
+
+We try a small ranked list of fonts and pick the first one actually
+installed on the machine.  /Comic Code Ligatures/ is the user's
+preference (a commercial font from Tobias Frere-Jones); the cascade
+falls back through Iosevka, JetBrains Mono, Fira Code, Cascadia Code,
+DejaVu Sans Mono, so the same configuration boots cleanly on any
+machine.
+
+** Scrolling and parens
+:PROPERTIES:
+:CUSTOM_ID: scrolling
+:END:
+
+Line numbers only in ~prog-mode~ -- they distract in prose.  Scrolling
+is one line at a time with a 3-line top/bottom margin and pixel-precise
+trackpad scrolling on Emacs 29+.  Matching parens are highlighted with
+zero delay.
+
+#+begin_src emacs-lisp :tangle lisp/setup-ui.el
+;;; setup-ui.el --- Look and feel -*- lexical-binding: t; -*-
+
+;; Visual choices for the editor:
+;;
+;;   * theme:  `gruber-darker' -- a dark, low-saturation theme inherited
+;;             from the user's previous configuration;
+;;   * font:   "Comic Code Ligatures" at 220 (~22pt), with sensible
+;;             fallbacks so the config still works on machines that don't
+;;             have that commercial font installed;
+;;   * line numbers and a couple of other prog-mode niceties.
+;;
+;; Anything that affects keybindings or buffer behaviour belongs in
+;; `setup-editor.el', not here.
+
+;;; Code:
+
+;; ---------------------------------------------------------------------------
+;; Theme
+;; ---------------------------------------------------------------------------
+(use-package gruber-darker-theme
+  :config
+  ;; `load-theme' interactively asks for confirmation the first time you
+  ;; load a theme from a new directory, which is a security feature for
+  ;; arbitrary themes.  We trust this one, so we pass NO-CONFIRM.
+  (load-theme 'gruber-darker :no-confirm))
+
+;; ---------------------------------------------------------------------------
+;; Font
+;; ---------------------------------------------------------------------------
+;;
+;; We try a small ranked list of fonts and pick the first one that is
+;; actually installed.  This way the same config works on multiple machines
+;; without having to manually edit init.el on each of them.
+;;
+;; If you want to add or change fonts, just edit the list below.  The first
+;; entry is the user's preferred font.
+(defun emacs.d/first-installed-font (candidates)
+  "Return the first font name from CANDIDATES that is installed, or nil."
+  (seq-find (lambda (f) (find-font (font-spec :name f))) candidates))
+
+(let ((font (emacs.d/first-installed-font
+             '("Comic Code Ligatures"
+               "Comic Code"
+               "Iosevka"
+               "JetBrains Mono"
+               "Fira Code"
+               "Cascadia Code"
+               "DejaVu Sans Mono"))))
+  (when font
+    (set-face-attribute 'default nil
+                        :font   font
+                        ;; :height is in 1/10 of a point, so 220 == 22pt.
+                        :height 220)))
+
+;; ---------------------------------------------------------------------------
+;; Line numbers and column number
+;; ---------------------------------------------------------------------------
+;;
+;; Line numbers only in programming buffers -- in prose / org / dired they
+;; just clutter.
+(add-hook 'prog-mode-hook #'display-line-numbers-mode)
+(setq display-line-numbers-width-start t) ;; reserve space upfront, no jitter
+
+(column-number-mode 1)
+(line-number-mode   1)
+
+;; ---------------------------------------------------------------------------
+;; Smooth scrolling
+;; ---------------------------------------------------------------------------
+;;
+;; The default scrolling logic recenters the point when it scrolls off
+;; screen, which is jarring.  These three settings together give a more
+;; "modern editor" feel: scroll one line at a time, never recenter, keep a
+;; 3-line margin from the top/bottom of the window.
+(setq scroll-conservatively           101
+      scroll-margin                   3
+      scroll-preserve-screen-position t
+      auto-window-vscroll             nil)
+
+;; Pixel-precision mouse / trackpad scrolling on Emacs 29+.
+(when (fboundp 'pixel-scroll-precision-mode)
+  (pixel-scroll-precision-mode 1))
+
+;; ---------------------------------------------------------------------------
+;; Misc visual polish
+;; ---------------------------------------------------------------------------
+
+;; Highlight the current line in programming buffers.  Keep it off in prose
+;; / org / dired where it's distracting.
+(add-hook 'prog-mode-hook #'hl-line-mode)
+
+;; Show matching parens/brackets without delay.
+(setq show-paren-delay 0)
+(show-paren-mode 1)
+
+;; Use spaces for the visual fringes between buffer and window edge.
+(set-fringe-mode 8)
+
+;; Frame title: show buffer name (and project, if available) -- handy when
+;; you alt-tab between many Emacs frames.
+(setq frame-title-format
+      '((:eval (if (buffer-file-name)
+                   (abbreviate-file-name (buffer-file-name))
+                 "%b"))
+        " — Emacs"))
+
+(provide 'setup-ui)
+;;; setup-ui.el ends here
+#+end_src
+
+* Editor basics                                                  :EDITOR:
+:PROPERTIES:
+:CUSTOM_ID: editor
+:END:
+
+Defaults that turn Emacs from a 1990s text editor into a comfortable
+modern one: short y/n answers, persistent point/history/recent files,
+auto-revert when files change on disk, sane backup-file layout, no
+lock-files, electric-pair / delete-selection modes, automatic
+re-tangling of /this very document/ on save.
+
+#+begin_src emacs-lisp :tangle lisp/setup-editor.el
+;;; setup-editor.el --- Core editing behaviour -*- lexical-binding: t; -*-
+
+;; Things every Emacs user wants once they realise the defaults are from
+;; another era:
+;;
+;;   * `y'/`n' instead of `yes'/`no' confirmations,
+;;   * remember point position across sessions (`save-place'),
+;;   * persistent minibuffer history (`savehist'),
+;;   * recent files list (`recentf'),
+;;   * automatic reload when a file changes on disk (`auto-revert'),
+;;   * sane defaults for tabs vs spaces, backup files, encoding,
+;;   * automatic re-tangling of `config.org' on save (so the literate
+;;     workflow is frictionless).
+;;
+;; This module is intentionally non-opinionated about keybindings beyond a
+;; handful of universally-expected ones; pick your own elsewhere.
+
+;;; Code:
+
+;; ---------------------------------------------------------------------------
+;; Y/N answers
+;; ---------------------------------------------------------------------------
+;;
+;; Old advice was `(fset 'yes-or-no-p 'y-or-n-p)' but Emacs 28 introduced a
+;; first-class option that handles a few edge cases properly.
+(setq use-short-answers t)
+
+;; ---------------------------------------------------------------------------
+;; Encoding -- be unambiguously UTF-8
+;; ---------------------------------------------------------------------------
+(set-charset-priority 'unicode)
+(prefer-coding-system        'utf-8-unix)
+(set-default-coding-systems  'utf-8-unix)
+(set-terminal-coding-system  'utf-8-unix)
+(set-keyboard-coding-system  'utf-8-unix)
+(setq locale-coding-system   'utf-8-unix)
+
+;; ---------------------------------------------------------------------------
+;; Tabs and indentation
+;; ---------------------------------------------------------------------------
+(setq-default indent-tabs-mode nil   ;; insert spaces, not literal tabs
+              tab-width        4)    ;; but render tabs as 4 cols when present
+
+;; ---------------------------------------------------------------------------
+;; Backup and auto-save layout
+;; ---------------------------------------------------------------------------
+;;
+;; By default Emacs litters the whole filesystem with `foo.txt~' files and
+;; `#foo.txt#' auto-save files.  We funnel both into subdirectories of
+;; `user-emacs-directory' so the rest of the disk stays clean.
+(let ((backup-dir    (expand-file-name "var/backups/"   user-emacs-directory))
+      (autosave-dir  (expand-file-name "var/auto-save/" user-emacs-directory)))
+  (make-directory backup-dir   t)
+  (make-directory autosave-dir t)
+  (setq backup-directory-alist         `(("." . ,backup-dir))
+        auto-save-file-name-transforms `((".*" ,autosave-dir t))
+        backup-by-copying              t  ;; don't clobber symlinks
+        version-control                t  ;; numbered backups
+        delete-old-versions            t
+        kept-new-versions              5
+        kept-old-versions              2))
+
+;; Lock files (`.#foo.txt') are useful for multi-user setups but mostly
+;; just confuse other tools (webpack, vim, file watchers...).  Disable.
+(setq create-lockfiles nil)
+
+;; ---------------------------------------------------------------------------
+;; Recent files, place, history
+;; ---------------------------------------------------------------------------
+;;
+;; All three are built-in but off by default.
+
+(use-package recentf
+  :ensure nil
+  :init   (setq recentf-max-saved-items 200
+                recentf-max-menu-items 25
+                recentf-auto-cleanup 'never)
+  :config (recentf-mode 1))
+
+(use-package saveplace
+  :ensure nil
+  :config (save-place-mode 1))
+
+(use-package savehist
+  :ensure nil
+  :init   (setq savehist-additional-variables
+                '(search-ring regexp-search-ring kill-ring))
+  :config (savehist-mode 1))
+
+;; ---------------------------------------------------------------------------
+;; Reload changed files
+;; ---------------------------------------------------------------------------
+;;
+;; Quietly refresh buffers when the underlying file changes -- handy when
+;; pulling git changes from another window, or when a build tool rewrites
+;; a generated file.  Also revert non-file buffers (dired, magit, ...).
+(use-package autorevert
+  :ensure nil
+  :init (setq auto-revert-verbose         nil
+              global-auto-revert-non-file-buffers t)
+  :config (global-auto-revert-mode 1))
+
+;; ---------------------------------------------------------------------------
+;; Pairs and selection
+;; ---------------------------------------------------------------------------
+
+;; Type the opening character, get the closing one for free.  Works for
+;; (), [], {}, "", ''.
+(electric-pair-mode 1)
+
+;; If a region is active and you type, replace the region.  Standard
+;; behaviour in basically every other editor.
+(delete-selection-mode 1)
+
+;; Visualise selection like other editors do (instead of inverse-video).
+(transient-mark-mode 1)
+
+;; ---------------------------------------------------------------------------
+;; Whitespace
+;; ---------------------------------------------------------------------------
+
+;; Strip trailing whitespace on save, but only in programming buffers --
+;; in prose buffers (org, markdown, ...) trailing spaces sometimes have
+;; semantic meaning (markdown line break).
+(add-hook 'before-save-hook
+          (lambda ()
+            (when (derived-mode-p 'prog-mode)
+              (delete-trailing-whitespace))))
+
+;; Always end files with a single trailing newline (POSIX).
+(setq require-final-newline t)
+
+;; ---------------------------------------------------------------------------
+;; Built-in conveniences
+;; ---------------------------------------------------------------------------
+
+;; Wrap long lines at word boundaries in text buffers.
+(add-hook 'text-mode-hook #'visual-line-mode)
+
+;; Highlight the symbol-at-point briefly after navigation -- helps to keep
+;; track of where you landed after a jump.
+(when (fboundp 'pulse-momentary-highlight-one-line)
+  (dolist (cmd '(other-window
+                 windmove-up windmove-down windmove-left windmove-right))
+    (advice-add cmd :after
+                (lambda (&rest _)
+                  (pulse-momentary-highlight-one-line (point))))))
+
+;; Disable the bell entirely (early-init also covers this; here it ensures
+;; no later mode re-enables it).
+(setq ring-bell-function 'ignore)
+
+;; ---------------------------------------------------------------------------
+;; Auto-tangle config.org on save
+;; ---------------------------------------------------------------------------
+;;
+;; This makes the literate workflow feel native: open `config.org', edit a
+;; src block, hit `C-x C-s', and the corresponding `setup-*.el' file is
+;; rewritten in place.  Because the modules are byte-compiled lazily by
+;; native-comp, the change shows up the next time Emacs starts (or
+;; immediately if you `M-x load-file' the affected module).
+(defun emacs.d/auto-tangle-config ()
+  "If the current buffer is `config.org', tangle it on save."
+  (when (and buffer-file-name
+             (string-equal (file-name-nondirectory buffer-file-name)
+                           "config.org")
+             (file-equal-p (file-name-directory buffer-file-name)
+                           user-emacs-directory))
+    (let ((org-confirm-babel-evaluate nil))
+      (org-babel-tangle))))
+
+(add-hook 'after-save-hook #'emacs.d/auto-tangle-config)
+
+(provide 'setup-editor)
+;;; setup-editor.el ends here
+#+end_src
+
+* Completion                                                :COMPLETION:
+:PROPERTIES:
+:CUSTOM_ID: completion
+:END:
+
+The "modern" Emacs completion stack, kept small and modular -- each
+package does one thing well and they compose freely.
+
+| Layer              | Package                                        | Role                                          |
+|--------------------+------------------------------------------------+-----------------------------------------------|
+| Minibuffer UI      | [[https://github.com/minad/vertico][vertico]]                                        | Vertical candidate list                       |
+| Annotations        | [[https://github.com/minad/marginalia][marginalia]]                                     | File size, key, docstring next to candidates  |
+| Matching style     | [[https://github.com/oantolin/orderless][orderless]]                                      | Type space-separated tokens in any order      |
+| Search & navigate  | [[https://github.com/minad/consult][consult]]                                        | Buffer / line / imenu / ripgrep pickers       |
+| In-buffer popup    | [[https://github.com/minad/corfu][corfu]]                                          | VSCode-style autocomplete inside a buffer     |
+| Extra backends     | [[https://github.com/minad/cape][cape]]                                           | File paths, dabbrev, keywords for ~corfu~     |
+| Key hints          | ~which-key~ (built in 30+)                     | Pop-up listing keys after a prefix            |
+
+#+begin_src emacs-lisp :tangle lisp/setup-completion.el
+;;; setup-completion.el --- Minibuffer + in-buffer completion -*- lexical-binding: t; -*-
+
+;; The "modern" Emacs completion stack, kept small and modular.  Each
+;; package does one thing well and they compose freely:
+;;
+;;   * `vertico'     -- vertical completion UI in the minibuffer
+;;                      (replaces the default horizontal list);
+;;   * `marginalia'  -- adds annotations next to each candidate
+;;                      (file size, command keybinding, docstring snippet);
+;;   * `orderless'   -- a fuzzy-ish completion style that lets you type
+;;                      space-separated tokens in any order ("buf rev" matches
+;;                      `revert-buffer'); much nicer than substring or
+;;                      flex matching alone;
+;;   * `consult'     -- a big collection of "search and pick" commands
+;;                      (buffers, lines, ripgrep, imenu, ...) that all use
+;;                      the same minibuffer UI;
+;;   * `corfu'       -- popup completion *inside* a buffer (think
+;;                      VSCode-style autocomplete);
+;;   * `cape'        -- extra completion-at-point backends for `corfu'
+;;                      (file paths, dabbrev, keywords);
+;;   * `which-key'   -- pops up a hint of available key bindings after a
+;;                      prefix.  Built into Emacs 30, no install needed.
+
+;;; Code:
+
+;; ---------------------------------------------------------------------------
+;; vertico -- minibuffer UI
+;; ---------------------------------------------------------------------------
+(use-package vertico
+  :init (vertico-mode 1)
+  :custom
+  (vertico-cycle t)            ;; wrap around at the top/bottom of the list
+  (vertico-resize t)           ;; let the minibuffer grow/shrink with results
+  (vertico-count 14))          ;; show this many candidates by default
+
+;; ---------------------------------------------------------------------------
+;; marginalia -- annotations
+;; ---------------------------------------------------------------------------
+(use-package marginalia
+  :after vertico
+  :init (marginalia-mode 1))
+
+;; ---------------------------------------------------------------------------
+;; orderless -- token-based fuzzy matching
+;; ---------------------------------------------------------------------------
+(use-package orderless
+  :custom
+  ;; Use orderless globally, but fall back to the built-in `basic' style
+  ;; when nothing else matches -- this is necessary for things like TRAMP
+  ;; remote file completion, which depend on prefix matching to work.
+  (completion-styles '(orderless basic))
+  (completion-category-overrides
+   '((file (styles basic partial-completion)))))
+
+;; ---------------------------------------------------------------------------
+;; consult -- search and navigate everything
+;; ---------------------------------------------------------------------------
+;;
+;; The bindings below replace a few stock commands with their consult-
+;; powered equivalents.  `M-y' for kill-ring browsing and `C-s' (isearch)
+;; -> `consult-line' are the two that most people fall in love with first.
+(use-package consult
+  :bind
+  (("C-x b"   . consult-buffer)        ;; switch buffer with live preview
+   ("C-x 4 b" . consult-buffer-other-window)
+   ("C-x p b" . consult-project-buffer)
+   ("M-y"     . consult-yank-pop)      ;; browse kill ring
+   ("M-g g"   . consult-goto-line)
+   ("M-g i"   . consult-imenu)         ;; jump to symbols in the current file
+   ("M-s l"   . consult-line)          ;; "I-search but better"
+   ("M-s r"   . consult-ripgrep)       ;; project-wide grep, requires `rg'
+   ("M-s f"   . consult-find))         ;; file finder, requires `find'/`fd'
+  :custom
+  (consult-narrow-key "<")             ;; press `<' to narrow to a category
+  (consult-preview-key 'any))          ;; preview as soon as you focus a candidate
+
+;; ---------------------------------------------------------------------------
+;; corfu -- in-buffer popup completion
+;; ---------------------------------------------------------------------------
+(use-package corfu
+  :init (global-corfu-mode 1)
+  :custom
+  (corfu-auto t)                ;; pop up automatically as you type
+  (corfu-auto-prefix 2)         ;; ...after this many characters
+  (corfu-auto-delay 0.1)        ;; ...with this much idle delay
+  (corfu-cycle t)               ;; wrap around the candidate list
+  (corfu-quit-no-match 'separator)
+  (corfu-preselect 'prompt)
+  ;; Show docstring of the highlighted candidate in the echo area.
+  (corfu-echo-documentation 0.25))
+
+;; ---------------------------------------------------------------------------
+;; cape -- extra completion-at-point backends
+;; ---------------------------------------------------------------------------
+;;
+;; Eglot already provides language-aware completion via
+;; `completion-at-point-functions'.  `cape' adds general-purpose ones --
+;; file paths, words from open buffers, keywords -- so completion still
+;; works in buffers with no LSP backend.
+(use-package cape
+  :init
+  (add-to-list 'completion-at-point-functions #'cape-dabbrev)
+  (add-to-list 'completion-at-point-functions #'cape-file)
+  (add-to-list 'completion-at-point-functions #'cape-keyword))
+
+;; ---------------------------------------------------------------------------
+;; which-key (built-in on Emacs 30+)
+;; ---------------------------------------------------------------------------
+;;
+;; Type a prefix like `C-x' and wait half a second; a popup at the bottom
+;; of the screen lists every key bound under that prefix.  Invaluable
+;; while learning Emacs and still useful as a power user.
+(use-package which-key
+  :ensure nil                ;; bundled with Emacs 30
+  :diminish which-key-mode
+  :init
+  (setq which-key-idle-delay 0.5
+        which-key-popup-type 'minibuffer)
+  :config
+  (which-key-mode 1))
+
+(provide 'setup-completion)
+;;; setup-completion.el ends here
+#+end_src
+
+* Programming language support                                     :PROG:
+:PROPERTIES:
+:CUSTOM_ID: prog
+:END:
+
+Tooling stack -- almost everything ships with Emacs 29+:
+
+- ~eglot~  -- Language Server Protocol client (built in),
+- ~flymake~ -- on-the-fly diagnostics (built in),
+- ~flymake-shellcheck~ -- standalone Bash linter,
+- ~eldoc~ -- documentation in the echo area (built in),
+- ~treesit~ + ~treesit-auto~ -- tree-sitter syntax highlighting.
+
+** Installing language servers
+:PROPERTIES:
+:CUSTOM_ID: lsp-install
+:END:
+
+Eglot does *not* install language servers for you.  You install the
+server through whatever package manager makes sense, and Eglot picks it
+up from ~PATH~.  Three reasonable strategies:
+
+1. *System-wide* (distro packages): quick, requires sudo, pins you to
+   whatever version your distro shipped.
+2. *Per-user* (recommended): no sudo, easy to upgrade.  Examples:
+   ~pip install --user python-lsp-server~, ~rustup component add
+   rust-analyzer~, ~go install golang.org/x/tools/gopls@latest~,
+   ~npm i -g typescript-language-server typescript~.
+3. *Per-project* (most reproducible): ~nix develop~, ~mise~, ~asdf~,
+   a devcontainer, a project-local virtualenv.
+
+A long install cheat-sheet for the most common languages lives at the
+top of [[file:lisp/setup-prog.el][setup-prog.el]].
+
+** ShellCheck for Bash
+:PROPERTIES:
+:CUSTOM_ID: shellcheck
+:END:
+
+If ~bash-language-server~ is installed, Eglot already provides
+ShellCheck diagnostics through LSP.  ~flymake-shellcheck~ is the
+fallback for plain ~sh-mode~ files where no LSP server is running: it
+shells out to the standalone ~shellcheck~ binary and feeds the results
+into Flymake.  Both can coexist; LSP wins when present.
+
+#+begin_src emacs-lisp :tangle lisp/setup-prog.el
+;;; setup-prog.el --- Programming: LSP, linting, docs, syntax -*- lexical-binding: t; -*-
+
+;; This module wires up the modern Emacs programming experience using
+;; what already ships in Emacs 29+, plus a couple of small helpers from
+;; ELPA.  Nothing exotic, nothing magic.
+;;
+;;   * `eglot'             -- Language Server Protocol (LSP) client.
+;;                            Zero config for most languages: install the
+;;                            language server somewhere on `PATH', open a
+;;                            file, and you get completion, go-to-def,
+;;                            find-references, rename, hover docs, format,
+;;                            code actions -- the lot.
+;;   * `flymake'           -- on-the-fly syntax/semantic checking.  Eglot
+;;                            forwards LSP diagnostics through it.
+;;   * `flymake-shellcheck'-- standalone Flymake backend for ShellCheck;
+;;                            useful for `sh-mode' even when no LSP server
+;;                            is running.
+;;   * `eldoc'             -- documentation in the echo area for the
+;;                            symbol at point.  Eglot drives this too.
+;;   * `treesit'           -- tree-sitter integration.  Better syntax
+;;                            highlighting and structural navigation than
+;;                            the legacy regex-based `font-lock'.
+;;   * `treesit-auto'      -- helper that downloads grammars on demand
+;;                            and remaps `foo-mode' to `foo-ts-mode' when
+;;                            a grammar is available.
+;;
+;; ---------------------------------------------------------------------------
+;; How language servers get installed
+;; ---------------------------------------------------------------------------
+;;
+;; Eglot does *not* install language servers for you (unlike `lsp-mode',
+;; which ships `lsp-install-server', or `mason.nvim' on the Neovim side).
+;; You install the server through whatever package manager makes sense,
+;; and Eglot picks it up from `PATH'.  Three reasonable strategies:
+;;
+;;   1. System-wide: distro packages.  Quick, but requires `sudo' and
+;;      pins you to whatever version your distro shipped.
+;;        Debian/Ubuntu:  `sudo apt install clangd gopls'
+;;        Fedora:         `sudo dnf install clang-tools-extra gopls'
+;;        Arch:           `sudo pacman -S clang gopls'
+;;
+;;   2. Per-user (recommended): no `sudo', easy to upgrade, isolates from
+;;      system Python/Node:
+;;        Python:    `pip install --user python-lsp-server'  (or `pyright')
+;;        Rust:      `rustup component add rust-analyzer'
+;;        Go:        `go install golang.org/x/tools/gopls@latest'
+;;        Node CLI:  `npm i -g typescript-language-server typescript'
+;;        Brew/mac:  `brew install <server>'
+;;
+;;   3. Per-project (most reproducible): `nix develop', `mise', `asdf',
+;;      a devcontainer, or just a project-local virtualenv.  Each project
+;;      brings its own pinned version, no global state to drift.
+;;
+;; ---------------------------------------------------------------------------
+;; Cheat-sheet of useful language servers
+;; ---------------------------------------------------------------------------
+;;
+;; Pick what you actually use; you don't need them all.  The install
+;; command is the most popular one as of 2026; replace with your package
+;; manager of choice.
+;;
+;;   Language        | Server                     | Install (one option)
+;;   ----------------+----------------------------+--------------------------------------------------
+;;   Python          | python-lsp-server (pylsp)  | pip install --user 'python-lsp-server[all]'
+;;                   | pyright                    | npm i -g pyright
+;;                   | ruff (linter+fmt as LSP)   | pip install --user ruff-lsp
+;;   Rust            | rust-analyzer              | rustup component add rust-analyzer
+;;   C / C++ / Obj-C | clangd                     | apt install clangd  /  brew install llvm
+;;   Go              | gopls                      | go install golang.org/x/tools/gopls@latest
+;;   TypeScript / JS | typescript-language-server | npm i -g typescript-language-server typescript
+;;   Bash            | bash-language-server (*)   | npm i -g bash-language-server
+;;   HTML/CSS/JSON   | vscode-langservers-extracted | npm i -g vscode-langservers-extracted
+;;   YAML            | yaml-language-server       | npm i -g yaml-language-server
+;;   TOML            | taplo                      | cargo install taplo-cli --features lsp
+;;   Markdown        | marksman                   | brew install marksman  (or release binary)
+;;   Lua             | lua-language-server        | brew install lua-language-server
+;;   Dockerfile      | dockerfile-language-server | npm i -g dockerfile-language-server-nodejs
+;;   Terraform       | terraform-ls               | brew install hashicorp/tap/terraform-ls
+;;   Nix             | nil                        | nix profile install nixpkgs#nil
+;;   Zig             | zls                        | https://zigtools.org/zls/install/
+;;   Haskell         | haskell-language-server    | ghcup install hls
+;;   OCaml           | ocaml-lsp-server           | opam install ocaml-lsp-server
+;;   Java            | eclipse.jdt.ls (jdtls)     | brew install jdtls
+;;   Kotlin          | kotlin-language-server     | brew install kotlin-language-server
+;;   Elixir          | elixir-ls                  | brew install elixir-ls
+;;   Ruby            | solargraph                 | gem install --user-install solargraph
+;;   PHP             | intelephense               | npm i -g intelephense
+;;   LaTeX           | texlab                     | cargo install --git https://github.com/latex-lsp/texlab
+;;   Vue             | vue-language-server (volar)| npm i -g @vue/language-server
+;;   Svelte          | svelte-language-server     | npm i -g svelte-language-server
+;;
+;; (*) `bash-language-server' ships shellcheck integration internally, so
+;;     you get the same warnings as the standalone `shellcheck' CLI plus
+;;     LSP features (rename, go-to-def for functions, ...).
+
+;;; Code:
+
+;; ---------------------------------------------------------------------------
+;; tree-sitter
+;; ---------------------------------------------------------------------------
+(use-package treesit
+  :ensure nil                     ;; built in
+  :custom
+  ;; Maximum tree-sitter highlighting detail.  The default 3 hides some
+  ;; useful faces (e.g. variable definitions vs. usages).
+  (treesit-font-lock-level 4))
+
+(use-package treesit-auto
+  :custom (treesit-auto-install 'prompt)   ;; ask before downloading grammars
+  :config
+  (treesit-auto-add-to-auto-mode-alist 'all)
+  (global-treesit-auto-mode 1))
+
+;; ---------------------------------------------------------------------------
+;; Eglot -- LSP client
+;; ---------------------------------------------------------------------------
+(use-package eglot
+  :ensure nil
+  :custom
+  ;; Don't log every JSON message to a buffer -- it's slow and noisy.
+  ;; Re-enable temporarily when debugging a server issue.
+  (eglot-events-buffer-size 0)
+  ;; Some servers report a confidence-or-detail level for every keystroke.
+  ;; Trim the noise down to the diagnostics we actually act on.
+  (eglot-extend-to-xref t)
+  :bind
+  (:map eglot-mode-map
+        ("C-c l a" . eglot-code-actions)
+        ("C-c l r" . eglot-rename)
+        ("C-c l f" . eglot-format)
+        ("C-c l d" . eldoc))
+  :hook
+  ;; Auto-start Eglot for these modes.  Add (or remove) entries as your
+  ;; language palette grows.  Modes are listed in their tree-sitter form
+  ;; where one exists; Eglot is happy with either.  Eglot only starts if
+  ;; the matching server is found on `PATH', so it's safe to leave entries
+  ;; here for languages whose servers you haven't installed yet -- you
+  ;; just won't get LSP features for those until you install the server.
+  ((python-base-mode  . eglot-ensure)
+   (python-ts-mode    . eglot-ensure)
+   (rust-ts-mode      . eglot-ensure)
+   (c-ts-mode         . eglot-ensure)
+   (c++-ts-mode       . eglot-ensure)
+   (go-ts-mode        . eglot-ensure)
+   (typescript-ts-mode . eglot-ensure)
+   (tsx-ts-mode       . eglot-ensure)
+   (js-ts-mode        . eglot-ensure)
+   (sh-mode           . eglot-ensure)
+   (bash-ts-mode      . eglot-ensure)
+   (lua-ts-mode       . eglot-ensure)
+   (yaml-ts-mode      . eglot-ensure)
+   (json-ts-mode      . eglot-ensure)
+   (toml-ts-mode      . eglot-ensure)
+   (dockerfile-ts-mode . eglot-ensure)
+   (html-mode         . eglot-ensure)
+   (css-mode          . eglot-ensure)
+   (markdown-mode     . eglot-ensure)
+   (haskell-mode      . eglot-ensure)
+   (haskell-ts-mode   . eglot-ensure)
+   (java-mode         . eglot-ensure)
+   (java-ts-mode      . eglot-ensure)
+   (kotlin-mode       . eglot-ensure)
+   (kotlin-ts-mode    . eglot-ensure)
+   (elixir-mode       . eglot-ensure)
+   (elixir-ts-mode    . eglot-ensure)
+   (ruby-mode         . eglot-ensure)
+   (ruby-ts-mode      . eglot-ensure)
+   (php-mode          . eglot-ensure)
+   (zig-mode          . eglot-ensure)
+   (nix-mode          . eglot-ensure)
+   (LaTeX-mode        . eglot-ensure)))
+
+;; ---------------------------------------------------------------------------
+;; Flymake -- on-the-fly diagnostics
+;; ---------------------------------------------------------------------------
+(use-package flymake
+  :ensure nil
+  :hook (prog-mode . flymake-mode)
+  :bind
+  (:map flymake-mode-map
+        ("M-n" . flymake-goto-next-error)
+        ("M-p" . flymake-goto-prev-error)
+        ("C-c ! l" . flymake-show-buffer-diagnostics)
+        ("C-c ! L" . flymake-show-project-diagnostics)))
+
+;; ---------------------------------------------------------------------------
+;; ShellCheck for shell scripts
+;; ---------------------------------------------------------------------------
+;;
+;; If you have `bash-language-server' installed, Eglot will already give
+;; you ShellCheck diagnostics through LSP.  This package is the lightweight
+;; fallback for the (very common) case where the LSP server is missing:
+;; it shells out to the standalone `shellcheck' binary and feeds the
+;; results into Flymake.  Both can coexist -- the LSP entries simply take
+;; priority when present.
+;;
+;; Install ShellCheck itself with your package manager:
+;;     apt install shellcheck   /   brew install shellcheck   /   dnf install ShellCheck
+;;
+;; For best results in Bash specifically, the file should declare its
+;; dialect via a shebang or via `# shellcheck shell=bash'.
+(use-package flymake-shellcheck
+  :commands flymake-shellcheck-load
+  :hook ((sh-mode      . flymake-shellcheck-load)
+         (bash-ts-mode . flymake-shellcheck-load)))
+
+;; ---------------------------------------------------------------------------
+;; Eldoc -- documentation in the echo area / dedicated buffer
+;; ---------------------------------------------------------------------------
+(use-package eldoc
+  :ensure nil
+  :diminish eldoc-mode
+  :custom
+  ;; If Eldoc has more than one source of documentation, compose them all
+  ;; instead of showing only the first one.
+  (eldoc-documentation-strategy 'eldoc-documentation-compose-eagerly)
+  ;; Don't truncate the docstring -- spill into a dedicated *eldoc* buffer
+  ;; if it doesn't fit in the echo area.
+  (eldoc-echo-area-use-multiline-p t))
+
+;; ---------------------------------------------------------------------------
+;; Misc programming niceties
+;; ---------------------------------------------------------------------------
+
+;; Smerge resolves merge conflict markers semi-automatically; turn it on
+;; whenever a file with conflict markers is visited.
+(add-hook 'find-file-hook
+          (lambda ()
+            (save-excursion
+              (goto-char (point-min))
+              (when (re-search-forward "^<<<<<<< " nil t)
+                (smerge-mode 1)))))
+
+;; Compilation buffers should respect ANSI color escapes (build tools love
+;; them) and scroll to follow the output.
+(setq compilation-scroll-output 'first-error
+      compilation-ask-about-save nil)
+
+(use-package ansi-color
+  :ensure nil
+  :hook (compilation-filter . ansi-color-compilation-filter))
+
+(provide 'setup-prog)
+;;; setup-prog.el ends here
+#+end_src
+
+* Git via Magit                                                  :MAGIT:
+:PROPERTIES:
+:CUSTOM_ID: magit
+:END:
+
+[[https://magit.vc/][Magit]] is the most polished Git interface in any editor.  Two bindings,
+both global:
+
+- ~C-x g~     -- ~magit-status~ (the entry point to everything)
+- ~C-x M-g~   -- ~magit-dispatch~ (any other Magit transient)
+
+Inside the status buffer the most useful bindings are: ~s~ stage,
+~u~ unstage, ~c c~ commit, ~P p~ push, ~F p~ pull, ~b b~ switch branch,
+~?~ list every binding.
+
+#+begin_src emacs-lisp :tangle lisp/setup-magit.el
+;;; setup-magit.el --- Git porcelain via Magit -*- lexical-binding: t; -*-
+
+;; Magit is the most polished Git interface in any editor, period.  This
+;; module installs it and wires up the two universally-expected
+;; bindings -- everything else is discoverable from inside Magit itself
+;; via `?'.
+;;
+;; The only customisation here is to keep things quiet:
+;;   * we tell Magit not to show the splash buffer the first time you run
+;;     it,
+;;   * we ask the status buffer to refresh from a hook we control rather
+;;     than from a slow `find-file' hook that fires for every visited
+;;     file in a Git repo.
+
+;;; Code:
+
+(use-package magit
+  ;; If you've never used Magit before: open a buffer inside a Git repo
+  ;; and press `C-x g'.  That gets you the status buffer, which is the
+  ;; entry point to everything else.  In the status buffer:
+  ;;
+  ;;     s    stage the section under point
+  ;;     u    unstage
+  ;;     c c  start a commit
+  ;;     P p  push  (push transient)
+  ;;     F p  pull
+  ;;     l l  log
+  ;;     b b  switch branch
+  ;;     ?    list every binding
+  :bind
+  (("C-x g"   . magit-status)
+   ("C-x M-g" . magit-dispatch))     ;; "any other Magit transient I forgot"
+  :custom
+  (magit-define-global-key-bindings nil)   ;; we set our own above
+  (magit-save-repository-buffers 'dontask)  ;; auto-save before refreshing
+  (magit-refresh-status-buffer t)
+  ;; Show recent commits inline in the status buffer; helps you remember
+  ;; where you are without running `magit-log' every time.
+  (magit-log-section-commit-count 10)
+  :config
+  ;; Magit binds `<tab>' to `magit-section-toggle' which conflicts with
+  ;; nothing, but worth mentioning: hit TAB on any section header (like
+  ;; "Untracked files") to fold/unfold it.
+  )
+
+(provide 'setup-magit)
+;;; setup-magit.el ends here
+#+end_src
+
+* TRAMP                                                          :TRAMP:
+:PROPERTIES:
+:CUSTOM_ID: tramp
+:END:
+
+Open ~/ssh:host:/path~ to edit a remote file as if it were local.
+
+This module trades a bit of TRAMP's default paranoia for a much faster
+experience over SSH, while keeping the security properties of plain
+~ssh~ (host-key checking is *never* disabled).
+
+** Pre-requisites
+:PROPERTIES:
+:CUSTOM_ID: tramp-prereq
+:END:
+
+- a working ~ssh~ on ~PATH~ (Emacs uses your system OpenSSH);
+- an ~~/.ssh/config~ with ~ControlMaster auto~ for the hosts you visit
+  often.  With ControlMaster set up, every TRAMP operation reuses the
+  same SSH connection -- the single biggest speed win over remote
+  editing.  Example block:
+
+  #+begin_example
+  Host *
+      ControlMaster auto
+      ControlPath   ~/.ssh/cm-%r@%h:%p
+      ControlPersist 10m
+      ServerAliveInterval 60
+  #+end_example
+
+#+begin_src emacs-lisp :tangle lisp/setup-tramp.el
+;;; setup-tramp.el --- Remote editing over SSH -*- lexical-binding: t; -*-
+
+;; TRAMP lets you edit remote files transparently.  You type
+;;
+;;     C-x C-f /ssh:user@host:/etc/nginx/nginx.conf
+;;
+;; and Emacs opens the remote file as if it were local.  Magit, dired,
+;; eshell, projects -- all of them work over TRAMP without changes.
+;;
+;; The defaults are conservative: TRAMP is paranoid about staleness, runs
+;; small probes for every operation, and re-establishes the SSH connection
+;; more often than a human would.  This module trades a bit of paranoia
+;; for a *much* faster experience over SSH, while keeping the security
+;; properties of plain `ssh' (we never disable host key checking).
+;;
+;; Pre-requisites on your local machine:
+;;
+;;   * a working `ssh' on `PATH' (Emacs uses your system SSH client),
+;;   * an `~/.ssh/config' with `ControlMaster auto' and `ControlPersist'
+;;     for the hosts you visit often.  Example block:
+;;
+;;         Host *
+;;             ControlMaster auto
+;;             ControlPath   ~/.ssh/cm-%r@%h:%p
+;;             ControlPersist 10m
+;;             ServerAliveInterval 60
+;;
+;; With ControlMaster set up, every TRAMP operation reuses the same SSH
+;; connection, which is the single biggest speed win.
+
+;;; Code:
+
+(use-package tramp
+  :ensure nil               ;; built in
+  :defer t                  ;; only load when you actually open a remote file
+  :custom
+
+  ;; -----------------------------------------------------------------------
+  ;; Default method
+  ;; -----------------------------------------------------------------------
+  ;;
+  ;; `ssh' is fast, plain, and uses your system OpenSSH (so all your
+  ;; `~/.ssh/config' tweaks Just Work).  `scp' is slightly faster for
+  ;; one-off file fetches but doesn't share the SSH ControlMaster, so
+  ;; `ssh' is the better default.
+  (tramp-default-method "ssh")
+
+  ;; -----------------------------------------------------------------------
+  ;; Don't print "Connecting to host..." spam
+  ;; -----------------------------------------------------------------------
+  (tramp-verbose 1)         ;; default is 3; 1 silences most progress noise.
+                            ;; Bump back to 6 when debugging a connection.
+
+  ;; -----------------------------------------------------------------------
+  ;; Persistent connection state
+  ;; -----------------------------------------------------------------------
+  ;;
+  ;; TRAMP caches "remote process environment" facts to a file so that
+  ;; reconnecting to a host after restart is fast.
+  (tramp-persistency-file-name
+   (expand-file-name "var/tramp" user-emacs-directory))
+
+  ;; -----------------------------------------------------------------------
+  ;; Don't keep version-control info for remote files
+  ;; -----------------------------------------------------------------------
+  ;;
+  ;; The built-in vc.el probes every visited file for VCS metadata, which
+  ;; over a slow network turns into many small SSH calls.  Magit operates
+  ;; through a single SSH connection and is much faster, so we just turn
+  ;; the per-file VC probing off for remote files.
+  (vc-handled-backends '(Git))            ;; only Git, no CVS/RCS/SVN/...
+
+  ;; -----------------------------------------------------------------------
+  ;; Faster directory listings
+  ;; -----------------------------------------------------------------------
+  ;;
+  ;; TRAMP uses a series of probes to discover what `ls' on the remote
+  ;; understands.  Caching the result avoids redoing the probes on every
+  ;; reconnection.
+  (tramp-completion-reread-directory-timeout nil)
+
+  :config
+
+  ;; -----------------------------------------------------------------------
+  ;; Don't track remote files in the recent-files / save-place lists
+  ;; -----------------------------------------------------------------------
+  ;;
+  ;; They tend to expire (host changes IP, name changes), and probing them
+  ;; on startup is slow.  Keep the recent-files list local-only.
+  (with-eval-after-load 'recentf
+    (add-to-list 'recentf-exclude
+                 (lambda (f) (file-remote-p f))))
+
+  (with-eval-after-load 'saveplace
+    (defun emacs.d/save-place-skip-remote (orig-fn &rest args)
+      "Skip `save-place' bookkeeping for remote files."
+      (unless (and buffer-file-name (file-remote-p buffer-file-name))
+        (apply orig-fn args)))
+    (advice-add 'save-place-to-alist :around #'emacs.d/save-place-skip-remote))
+
+  ;; -----------------------------------------------------------------------
+  ;; Disable file-name handlers TRAMP doesn't need on remote paths
+  ;; -----------------------------------------------------------------------
+  ;;
+  ;; The built-in `tramp-archive' handler matches archive members
+  ;; (foo.tar.gz inside a remote dir) but is rarely useful and slows down
+  ;; every remote `find-file'.  Loading is deferred so this is safe even
+  ;; if you do want it later -- just `M-x tramp-archive-cleanup' first.
+  (setq tramp-archive-enabled nil)
+
+  ;; -----------------------------------------------------------------------
+  ;; Use the remote `PATH'
+  ;; -----------------------------------------------------------------------
+  ;;
+  ;; By default TRAMP uses a sanitised PATH that often misses tools the
+  ;; remote shell would find (homebrew, asdf, mise, ...).  Append the
+  ;; remote login shell's PATH so commands like `git' or `node' resolve.
+  (add-to-list 'tramp-remote-path 'tramp-own-remote-path)
+
+  ;; -----------------------------------------------------------------------
+  ;; Don't auto-save remote files locally
+  ;; -----------------------------------------------------------------------
+  ;;
+  ;; Auto-saving over SSH is slow and the local copy of an auto-save
+  ;; defeats the point of editing remotely.  We disable it -- you still
+  ;; have full undo, and `C-x C-s' to save explicitly.
+  (setq remote-file-name-inhibit-auto-save-visited t))
+
+(provide 'setup-tramp)
+;;; setup-tramp.el ends here
+#+end_src
+
+* Footer
+:PROPERTIES:
+:CUSTOM_ID: footer
+:END:
+
+If you've reached this point, congratulations -- you've read the entire
+configuration.  Issues and pull requests are welcome at:
+
+  https://github.com/SweatierKey/emacs.d

@@ -1,0 +1,88 @@
+#+TITLE: emacs.d
+#+OPTIONS: toc:nil num:nil
+
+A small, modern, /literate/ Emacs configuration.
+
+The whole configuration is described and generated from a single file:
+[[file:config.org][~config.org~]].  Each section of that file documents a slice of the
+setup and tangles into a small ~setup-*.el~ module under [[file:lisp/][~lisp/~]].  The
+result is a configuration you can read like a book and tweak by editing
+prose + code in the same place.
+
+* Highlights
+
+- *Built on Emacs 30+ defaults.*  ~use-package~, ~eglot~, ~flymake~,
+  ~eldoc~, ~which-key~ and tree-sitter all ship with Emacs itself --
+  no external dependency to install just to bootstrap.
+- *Modern completion stack*: [[https://github.com/minad/vertico][vertico]] · [[https://github.com/minad/marginalia][marginalia]] · [[https://github.com/oantolin/orderless][orderless]] ·
+  [[https://github.com/minad/consult][consult]] · [[https://github.com/minad/corfu][corfu]] · [[https://github.com/minad/cape][cape]].
+- *LSP without ceremony*: [[https://www.gnu.org/software/emacs/manual/html_mono/eglot.html][Eglot]] auto-starts for ~30+~ languages, with
+  ~flymake~ for diagnostics, ~eldoc~ for hover docs, and
+  ~flymake-shellcheck~ as a Bash fallback.
+- *Tree-sitter syntax highlighting* via ~treesit-auto~ -- grammars are
+  downloaded on demand.
+- *Magit* for Git, *TRAMP* tuned for SSH, *gcmh* for invisible GC.
+- *Backups, auto-saves and TRAMP cache* are funnelled into ~var/~ so the
+  rest of the disk stays clean.
+
+* Layout
+
+#+begin_example
+.emacs.d/
+├── early-init.el       Pre-init tweaks (GC, file handlers, UI flicker)
+├── init.el             Bootstrap: package, use-package, require modules
+├── config.org          Single source of truth (literate config)
+├── lisp/
+│   ├── setup-memory.el      GC + memory tuning
+│   ├── setup-ui.el          Theme, font, scrolling, line numbers
+│   ├── setup-editor.el      Built-in editing tweaks + auto-tangle hook
+│   ├── setup-completion.el  vertico, marginalia, orderless, consult, corfu
+│   ├── setup-prog.el        eglot, flymake, eldoc, treesit, shellcheck
+│   ├── setup-magit.el       Git porcelain
+│   └── setup-tramp.el       Remote editing over SSH
+├── var/                Generated state: backups, auto-saves, tramp cache
+├── elpa/               Installed packages (gitignored)
+└── eln-cache/          Native-comp cache (gitignored)
+#+end_example
+
+* Installation
+
+#+begin_src bash
+git clone https://github.com/SweatierKey/emacs.d ~/.emacs.d
+emacs
+#+end_src
+
+The first start downloads the third-party packages from MELPA / GNU
+ELPA / NonGNU ELPA.  After it settles you have a fully working editor.
+
+** Optional system-level dependencies
+
+These are not strictly required, but the configuration plays better
+when they are present:
+
+| Tool         | Why                                                        |
+|--------------+------------------------------------------------------------|
+| ~rg~ (ripgrep) | powers ~consult-ripgrep~ (project-wide search)            |
+| ~fd~         | a faster alternative to ~find~ for ~consult-find~          |
+| ~git~        | required by Magit                                          |
+| ~shellcheck~ | required by ~flymake-shellcheck~                           |
+| ~mpv~ + ~yt-dlp~ | only if you re-add ~empv~ later                        |
+
+Per-language LSP servers are listed in [[file:lisp/setup-prog.el][~lisp/setup-prog.el~]] -- install
+the ones you actually use.
+
+* Requirements
+
+- *Emacs 29.1 or newer.*  The configuration will refuse to start on
+  anything older (see the version check at the top of ~init.el~).
+- A dark terminal/GUI; the default theme is ~gruber-darker~.
+
+* License
+
+Made available under the [[https://opensource.org/license/mit][MIT License]].
+
+* See also
+
+- [[https://www.gnu.org/software/emacs/manual/html_mono/eglot.html][Eglot manual]]
+- [[https://magit.vc/manual/][Magit manual]]
+- [[https://www.gnu.org/software/emacs/manual/html_node/org/Working-with-Source-Code.html][Org Babel manual (literate workflow)]]
