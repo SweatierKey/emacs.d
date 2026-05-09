@@ -90,6 +90,28 @@
 (package-initialize)
 
 ;; ---------------------------------------------------------------------------
+;; Emacs 30 ships a *stub* of `compat' -- override it
+;; ---------------------------------------------------------------------------
+;;
+;; Emacs 30 includes a tiny placeholder file at
+;; `lisp/emacs-lisp/compat.el' that registers `compat' as a built-in
+;; package.  The intent is to stop old packages from `(require 'compat)'
+;; failing on a vanilla Emacs that already has the backports merged in.
+;;
+;; The side effect is harmful: `package.el' sees `compat' as already
+;; satisfied and refuses to install the *real* GNU ELPA `compat'
+;; (currently 31+), so dependents that need recent additions like
+;; `static-when' (transient 0.13.x, magit 4.5.x) blow up at byte-compile
+;; or runtime with `void-function static-when'.
+;;
+;; We unregister `compat' from the built-in tables so `package-install'
+;; will fetch the real version from GNU ELPA.  Anything that already
+;; works against the stub keeps working too -- the elpa version is a
+;; superset.
+(setq package--builtins         (assq-delete-all 'compat package--builtins)
+      package--builtin-versions (assq-delete-all 'compat package--builtin-versions))
+
+;; ---------------------------------------------------------------------------
 ;; Refresh package metadata when stale
 ;; ---------------------------------------------------------------------------
 ;;
