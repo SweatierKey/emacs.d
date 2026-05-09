@@ -14,9 +14,42 @@
 
 ;;; Code:
 
+(require 'cl-lib)        ;; cl-loop used by the face-attribute advice below
+
 ;; ---------------------------------------------------------------------------
 ;; Theme
 ;; ---------------------------------------------------------------------------
+;;
+;; Emacs 30 tightened `set-face-attribute' validation: passing nil as
+;; the value for `:background' / `:foreground' / `:underline' /
+;; `:overline' now triggers a noisy warning.  Older themes (gruber-
+;; darker among them) still pass nil to mean "no override", and the
+;; idiomatic Emacs-30 way to express that is the symbol `unspecified'.
+;;
+;; The advice below transparently rewrites those nil values to
+;; `unspecified' for the four affected attributes; nothing else is
+;; touched.  The check is cheap (one assoc per attribute on every
+;; face-attribute change), runs only at theme-load time in practice,
+;; and is reverted automatically once `set-face-attribute' is called
+;; with proper values.
+(defun emacs.d/face-attribute-rewrite-nil (orig-fn face frame &rest props)
+  "Around-advice for `set-face-attribute' that translates nil values for
+colour-like attributes to the symbol `unspecified'.  This silences the
+\"nil value is invalid\" warnings emitted by older themes when run on
+Emacs 30+, without otherwise altering their intent."
+  (let ((rewritten
+         (cl-loop for (k v) on props by #'cddr
+                  append (list k
+                               (if (and (memq k '(:background :foreground
+                                                  :underline  :overline))
+                                        (null v))
+                                   'unspecified
+                                 v)))))
+    (apply orig-fn face frame rewritten)))
+
+(advice-add 'set-face-attribute :around
+            #'emacs.d/face-attribute-rewrite-nil)
+
 (use-package gruber-darker-theme
   :config
   ;; `load-theme' interactively asks for confirmation the first time you

@@ -34,6 +34,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)        ;; `cl-position' used by the rename-by-name helper
 (require 'subr-x)        ;; for `string-trim'
 
 ;; ---------------------------------------------------------------------------
@@ -67,7 +68,12 @@
                    (getenv "SHELL")
                    "/bin/bash"))
   :bind
-  (:map vterm-mode-map
+  (;; A global, mnemonic shortcut to summon a *local* vterm.  For SSH
+   ;; sessions managed by `setup-ssh-sessions' use `C-c s s' instead --
+   ;; that opens the session in a fresh tab with the bastion title
+   ;; preset.
+   ("C-c v" . vterm)
+   :map vterm-mode-map
         ;; Make `C-c C-t' toggle copy-mode the same way it does in tmux,
         ;; so muscle memory carries over.  In copy-mode you get normal
         ;; Emacs movement; press the same key again to resume sending
@@ -102,21 +108,26 @@
 ;; Dynamic tab title for vterm sessions
 ;; ---------------------------------------------------------------------------
 ;;
-;; The two pieces:
+;; Three buffer-local variables drive the title machinery:
 ;;
-;;   * `emacs.d/vterm-bastion-name'  -- set once when the session is
-;;     opened (by `setup-ssh-sessions').  Buffer-local; if nil we fall
-;;     back to using only the prompt-derived hostname.
+;;   * `emacs.d/vterm-bastion-name' -- string, set once when the session
+;;     is opened (by `setup-ssh-sessions').  Static for the lifetime of
+;;     the session.  Used as the prefix of the tab title.
 ;;
-;;   * `emacs.d/vterm-current-host'  -- updated by parsing the visible
-;;     prompt.  Buffer-local; recomputed by an after-change hook on
-;;     vterm output.
+;;   * `emacs.d/vterm-current-host' -- string, updated by parsing the
+;;     latest visible shell prompt.  May be nil while the prompt is
+;;     still being drawn.
 ;;
-;; The composed title is then shown via the tab-bar's
-;; `tab-bar-tab-name-function' so that the active vterm tab always
-;; reflects "BASTION: HOST".
+;;   * `emacs.d/vterm-tab-name' -- string, the tab title we last
+;;     installed.  Stored so we can find and rename "our" tab even when
+;;     the user has switched to a different one.
 ;;
-;; On non-vterm buffers we fall back to the default tab name behaviour.
+;; Strategy: instead of intercepting `tab-bar-tab-name-function' (which
+;; is called for *every* tab on every redraw and forces awkward
+;; signature shenanigans), we explicitly rename the relevant tab via
+;; `tab-bar-rename-tab' whenever the session detects a new host.  We
+;; locate the tab by its current name, so the rename works regardless
+;; of which tab the user is looking at.
 
 (defvar-local emacs.d/vterm-bastion-name nil
   "Name of the bastion / jump host this vterm session was opened against.
@@ -127,6 +138,12 @@ afterwards.  Used as the static prefix of the dynamic tab title.")
   "Hostname extracted from the most recent visible shell prompt.
 Updated by `emacs.d/vterm-update-current-host', which runs from a
 vterm output hook.  May be nil while the prompt is still being drawn.")
+
+(defvar-local emacs.d/vterm-tab-name nil
+  "Tab name we last applied for this vterm buffer's tab.
+Used to find the right tab to rename when the host changes -- we look
+it up by name rather than by index, since the user may have reordered
+or closed other tabs in the meantime.")
 
 (defcustom emacs.d/vterm-prompt-host-regexp
   ;; Match the user@host part of common Linux prompts:
@@ -160,25 +177,55 @@ output update -- that's far enough to find a prompt even if the user
 just pasted a screenful of output."
   (save-excursion
     (goto-char (point-max))
-    (let* ((window-end   (point))
-           (window-start (max (point-min)
-                              (save-excursion
-                                (forward-line -50)
-                                (point)))))
+    (let ((window-start (max (point-min)
+                             (save-excursion
+                               (forward-line -50)
+                               (point)))))
       (when (re-search-backward emacs.d/vterm-prompt-host-regexp
                                 window-start t)
         (match-string-no-properties 1)))))
 
+(defun emacs.d/tab-bar-rename-tab-by-name (old-name new-name)
+  "Rename the tab named OLD-NAME to NEW-NAME on the selected frame.
+
+Returns non-nil on success, nil if no tab with OLD-NAME exists.  Kept
+local to this module rather than upstreamed because the built-in
+`tab-bar-rename-tab' takes a 1-based tab number and we want to operate
+by name -- the user may have reordered tabs in between."
+  (let* ((tabs (funcall tab-bar-tabs-function))
+         (idx  (cl-position old-name tabs
+                            :key  (lambda (tab) (alist-get 'name tab))
+                            :test #'string-equal)))
+    (when idx
+      ;; `tab-bar-rename-tab' is 1-based and the "current tab" sentinel
+      ;; means "no number argument", so we always pass an explicit
+      ;; (1+ idx) -- otherwise we'd accidentally rename whichever tab
+      ;; the user is looking at.
+      (tab-bar-rename-tab new-name (1+ idx))
+      t)))
+
 (defun emacs.d/vterm-update-current-host (&rest _ignored)
-  "Refresh `emacs.d/vterm-current-host' from the visible prompt and
-trigger a tab-bar redraw if the value changed."
+  "Refresh `emacs.d/vterm-current-host' from the visible prompt.
+
+When the host changes, recompute the desired tab title (in the form
+\"BASTION: HOST\") and rename the tab accordingly via
+`emacs.d/tab-bar-rename-tab-by-name'."
   (when (derived-mode-p 'vterm-mode)
-    (let ((new (emacs.d/vterm-extract-prompt-host)))
-      (when (and new (not (equal new emacs.d/vterm-current-host)))
-        (setq-local emacs.d/vterm-current-host new)
-        (force-mode-line-update)
-        (when (fboundp 'tab-bar--update-tab-bar-lines)
-          (tab-bar--update-tab-bar-lines))))))
+    (let ((new-host (emacs.d/vterm-extract-prompt-host)))
+      (when (and new-host
+                 (not (equal new-host emacs.d/vterm-current-host)))
+        (setq-local emacs.d/vterm-current-host new-host)
+        (let* ((bastion      emacs.d/vterm-bastion-name)
+               (new-tab-name (if bastion
+                                 (format "%s: %s" bastion new-host)
+                               new-host)))
+          (when (and (bound-and-true-p tab-bar-mode)
+                     emacs.d/vterm-tab-name
+                     (not (string-equal new-tab-name
+                                        emacs.d/vterm-tab-name)))
+            (when (emacs.d/tab-bar-rename-tab-by-name
+                   emacs.d/vterm-tab-name new-tab-name)
+              (setq-local emacs.d/vterm-tab-name new-tab-name))))))))
 
 ;; vterm doesn't expose a clean "after every redraw" hook, but it does
 ;; advertise `vterm--filter' as the function it pipes terminal output
@@ -187,34 +234,6 @@ trigger a tab-bar redraw if the value changed."
 ;; characters (cursor movement, color codes, ...).
 (with-eval-after-load 'vterm
   (advice-add 'vterm--filter :after #'emacs.d/vterm-update-current-host))
-
-(defun emacs.d/vterm-tab-name (tab)
-  "Return the tab name to display for TAB.
-
-If TAB's underlying buffer is a vterm session we compose the name as
-\"BASTION: HOST\" using `emacs.d/vterm-bastion-name' and
-`emacs.d/vterm-current-host'.  Either part may be missing -- when both
-are nil we fall back to the default `tab-bar-tab-name-current'.
-
-Called by tab-bar through `tab-bar-tab-name-function', so the title
-refreshes every time the tab bar repaints."
-  (let* ((buf (window-buffer (or (cdr (assq 'wc tab))
-                                 (selected-window))))
-         (mode    (buffer-local-value 'major-mode buf))
-         (bastion (buffer-local-value 'emacs.d/vterm-bastion-name buf))
-         (host    (buffer-local-value 'emacs.d/vterm-current-host  buf)))
-    (cond
-     ((and (eq mode 'vterm-mode) bastion host)
-      (format "%s: %s" bastion host))
-     ((and (eq mode 'vterm-mode) bastion)
-      bastion)
-     ((and (eq mode 'vterm-mode) host)
-      host)
-     (t
-      ;; Default behaviour for non-vterm tabs (just the buffer name).
-      (buffer-name buf)))))
-
-(setq tab-bar-tab-name-function #'emacs.d/vterm-tab-name)
 
 (provide 'setup-terminal)
 ;;; setup-terminal.el ends here

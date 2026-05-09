@@ -178,11 +178,13 @@ description -- so you can search by any of them with Orderless."
     (unless session
       (user-error "Session %S not found" name))
 
-    ;; Open in a fresh tab so each session is visually separated; the
-    ;; tab title is "BASTION: HOST" -- BASTION being NAME (set below as
-    ;; a buffer-local) and HOST extracted from the prompt by
-    ;; `setup-terminal' once the connection is up.
+    ;; Open in a fresh tab so each session is visually separated.  We
+    ;; rename the tab to NAME *immediately* so the user sees the bastion
+    ;; label even before SSH has authenticated.  Once the remote prompt
+    ;; is visible, `setup-terminal''s host-detection logic will append
+    ;; ": HOST" to the tab title via `tab-bar-rename-tab'.
     (tab-bar-new-tab)
+    (tab-bar-rename-tab name)
 
     ;; Now spin up vterm in the freshly-created tab.  We set the shell
     ;; for this single buffer to our SSH command via a let-binding of
@@ -193,10 +195,11 @@ description -- so you can search by any of them with Orderless."
       (kill-buffer buf)        ;; placeholder, let vterm create its own
       (vterm vterm-buffer-name))
 
-    ;; Mark the freshly-created vterm buffer with the bastion name so
-    ;; the dynamic tab title can pick it up.
+    ;; Mark the freshly-created vterm buffer with metadata used by
+    ;; `setup-terminal' to keep the tab title in sync with the prompt.
     (with-current-buffer (current-buffer)
-      (setq-local emacs.d/vterm-bastion-name name))
+      (setq-local emacs.d/vterm-bastion-name name
+                  emacs.d/vterm-tab-name     name))
 
     (force-mode-line-update t)))
 
