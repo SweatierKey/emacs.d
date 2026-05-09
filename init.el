@@ -1,48 +1,16 @@
-;;; init.el --- Personal Emacs configuration entry point -*- lexical-binding: t; -*-
+;;; init.el --- Bootstrap -*- lexical-binding: t; -*-
 
-;; Author: Matteo  (https://github.com/SweatierKey)
-;;
-;; This is the *bootstrap* file.  Its job is intentionally tiny:
-;;
-;;   1. set up the package archives and `use-package',
-;;   2. make sure the literate `config.org' file is in sync with the
-;;      pre-tangled Lisp modules under `lisp/' (re-tangling on demand),
-;;   3. `require' those modules in the right order.
-;;
-;; The actual configuration -- with prose explanations -- lives in
-;; `config.org'.  Each top-level section of that file tangles to a small
-;; `setup-*.el' module under `lisp/'.  This way:
-;;
-;;   * `git clone' + `emacs' "just works" out of the box, because the
-;;     tangled `.el' files are committed alongside `config.org' and we never
-;;     depend on Org being available at boot time;
-;;   * editing `config.org' in Emacs and saving regenerates the relevant
-;;     module automatically (see the auto-tangle hook in `setup-editor.el');
-;;   * if you only want to read the config you open `config.org' and read
-;;     it like a book.
-;;
-;; This file is meant to be readable -- comments are intentionally verbose.
+;;; Commentary:
+;; Bootstrap entry point.  See config.org for the full literate
+;; configuration; this file only wires up the package system and
+;; loads each `setup-*.el' module from `lisp/'.
 
 ;;; Code:
 
-;; ---------------------------------------------------------------------------
-;; Sanity check: refuse to run on ancient Emacs versions
-;; ---------------------------------------------------------------------------
-;;
-;; The configuration leans on features that only exist in Emacs 29+ (Eglot
-;; built in, `use-package' built in, tree-sitter, `which-key' built in,
-;; etc.).  Failing fast with a clear message is friendlier than letting the
-;; user debug obscure errors later on.
 (when (version< emacs-version "29.1")
   (error "This configuration requires Emacs 29.1 or newer; you are running %s"
          emacs-version))
 
-;; ---------------------------------------------------------------------------
-;; Load path
-;; ---------------------------------------------------------------------------
-;;
-;; All modular files live in `<user-emacs-directory>/lisp'.  We add that
-;; directory to `load-path' so we can `require' them by short name.
 (defconst emacs.d/lisp-dir
   (expand-file-name "lisp" user-emacs-directory)
   "Directory holding the per-area `setup-*.el' modules.")
@@ -52,163 +20,73 @@
 
 (add-to-list 'load-path emacs.d/lisp-dir)
 
-;; ---------------------------------------------------------------------------
-;; Custom file
-;; ---------------------------------------------------------------------------
-;;
-;; By default `customize-*' commands write their output at the bottom of
-;; `init.el', which is messy in a version-controlled config.  We redirect
-;; them to a separate file that we *do not* track in git -- see
-;; `.gitignore'.
 (setq custom-file (expand-file-name "custom.el" user-emacs-directory))
 (when (file-exists-p custom-file)
   (load custom-file :no-error :no-message))
 
-;; ---------------------------------------------------------------------------
-;; Package archives + use-package
-;; ---------------------------------------------------------------------------
-;;
-;; We use:
-;;   - GNU ELPA (built in, ships with Emacs)
-;;   - NonGNU ELPA (built in since Emacs 28, packages with non-FSF copyright
-;;     assignment such as `magit')
-;;   - MELPA (community, the bulk of third-party packages)
 (require 'package)
 
 (setq package-archives
       '(("gnu"    . "https://elpa.gnu.org/packages/")
         ("nongnu" . "https://elpa.nongnu.org/nongnu/")
-        ("melpa"  . "https://melpa.org/packages/")))
-
-;; Pin a couple of important packages to GNU/NonGNU ELPA when they are also
-;; on MELPA, to avoid surprise breakages from MELPA's "always latest" policy.
-(setq package-archive-priorities
-      '(("gnu"    . 10)
-        ("nongnu" . 9)
-        ("melpa"  . 5)))
+        ("melpa"  . "https://melpa.org/packages/"))
+      package-archive-priorities
+      '(("gnu" . 10) ("nongnu" . 9) ("melpa" . 5)))
 
 (package-initialize)
 
-;; ---------------------------------------------------------------------------
-;; Emacs 30 ships a *stub* of `compat' -- override it
-;; ---------------------------------------------------------------------------
-;;
-;; Emacs 30 includes a tiny placeholder file at
-;; `lisp/emacs-lisp/compat.el' that registers `compat' as a built-in
-;; package.  The intent is to stop old packages from `(require 'compat)'
-;; failing on a vanilla Emacs that already has the backports merged in.
-;;
-;; The side effect is harmful: `package.el' sees `compat' as already
-;; satisfied and refuses to install the *real* GNU ELPA `compat'
-;; (currently 31+), so dependents that need recent additions like
-;; `static-when' (transient 0.13.x, magit 4.5.x) blow up at byte-compile
-;; or runtime with `void-function static-when'.
-;;
-;; We unregister `compat' from the built-in tables so `package-install'
-;; will fetch the real version from GNU ELPA.  Anything that already
-;; works against the stub keeps working too -- the elpa version is a
-;; superset.
+;; Emacs 30 ships a stub `compat.el' that registers the package as
+;; built-in; this prevents `package.el' from installing the real GNU
+;; ELPA compat that modern transient/magit need.  See config.org,
+;; section "Init bootstrap".
 (setq package--builtins         (assq-delete-all 'compat package--builtins)
       package--builtin-versions (assq-delete-all 'compat package--builtin-versions))
 
-;; ---------------------------------------------------------------------------
-;; Refresh package metadata when stale
-;; ---------------------------------------------------------------------------
-;;
-;; Refreshing on every boot is slow (one HTTPS round-trip per archive),
-;; but never refreshing is worse: MELPA / NonGNU prune old tarballs on a
-;; rolling basis, so a `use-package' call may try to install
-;; `magit-3.4.9.tar' from a metadata snapshot taken weeks ago when in
-;; reality the server now only has `magit-4.0.1.tar'.  The result is the
-;; classic "Not found" error during boot.
-;;
-;; The compromise: refresh automatically when the local archive cache is
-;; missing OR older than `emacs.d/package-refresh-stale-days' days.
-;; That keeps boots fast in the common case (cache is fresh enough)
-;; while preventing the stale-metadata trap.
 (defcustom emacs.d/package-refresh-stale-days 7
-  "How many days the package archive cache is allowed to age before we
-auto-refresh it on boot.  Set to 0 to refresh on every boot, or to a
-very large number to disable automatic refreshes (you'll have to run
-`M-x package-refresh-contents' yourself when packages start failing
-to install)."
-  :type 'integer
-  :group 'emacs.d)
+  "Days the local package archive cache may age before auto-refresh."
+  :type 'integer :group 'emacs.d)
 
 (defun emacs.d/package-refresh-if-stale ()
-  "Refresh `package-archive-contents' if the local cache is missing or
-older than `emacs.d/package-refresh-stale-days' days."
+  "Refresh `package-archive-contents' if the cache is missing or stale."
   (let* ((archive-dir (expand-file-name "archives" package-user-dir))
-         ;; We pick the GNU archive-contents file as the "freshness witness"
-         ;; -- it always exists once any refresh has run, regardless of
-         ;; which other archives are configured.
-         (witness     (expand-file-name "gnu/archive-contents" archive-dir))
-         (stale-p     (or (not (file-exists-p witness))
-                          (time-less-p
-                           (file-attribute-modification-time
-                            (file-attributes witness))
-                           (time-subtract (current-time)
-                                          (days-to-time
-                                           emacs.d/package-refresh-stale-days))))))
-    (when stale-p
+         (witness     (expand-file-name "gnu/archive-contents" archive-dir)))
+    (when (or (not (file-exists-p witness))
+              (time-less-p
+               (file-attribute-modification-time (file-attributes witness))
+               (time-subtract (current-time)
+                              (days-to-time emacs.d/package-refresh-stale-days))))
       (message "Package archives are stale; refreshing...")
       (package-refresh-contents))))
 
 (emacs.d/package-refresh-if-stale)
 
-;; `use-package' is bundled with Emacs 29+, so we just require it.  The
-;; helper variables below make the rest of the config more concise.
 (require 'use-package)
-(setq use-package-always-ensure  t   ;; auto-install missing packages
-      use-package-always-defer   nil ;; default; flip to t per package as needed
-      use-package-expand-minimally t ;; smaller macroexpansion -> faster boot
-      use-package-verbose        nil)
+(setq use-package-always-ensure   t
+      use-package-always-defer    nil
+      use-package-expand-minimally t
+      use-package-verbose         nil)
 
-;; ---------------------------------------------------------------------------
-;; Literate config: keep `lisp/*.el' in sync with `config.org'
-;; ---------------------------------------------------------------------------
-;;
-;; If the user edited `config.org' more recently than the tangled modules
-;; we re-tangle automatically.  This costs ~100ms once per edit, and zero
-;; on a normal boot where nothing changed.
 (defun emacs.d/maybe-tangle-config ()
-  "Re-tangle `config.org' if it is newer than any `lisp/setup-*.el' file."
-  (let* ((org-file  (expand-file-name "config.org" user-emacs-directory))
-         (any-stale (and (file-exists-p org-file)
-                         (let ((org-mtime (file-attribute-modification-time
-                                           (file-attributes org-file))))
-                           (seq-some
-                            (lambda (el)
-                              (time-less-p
-                               (file-attribute-modification-time
-                                (file-attributes el))
-                               org-mtime))
-                            (directory-files emacs.d/lisp-dir t "\\`setup-.*\\.el\\'"))))))
-    (when any-stale
-      (require 'org)
-      (require 'ob-tangle)
-      (message "config.org changed -- re-tangling...")
-      (org-babel-tangle-file org-file))))
+  "Re-tangle `config.org' when newer than any `lisp/setup-*.el' module."
+  (let* ((org-file (expand-file-name "config.org" user-emacs-directory))
+         (modules  (and (file-directory-p emacs.d/lisp-dir)
+                        (directory-files emacs.d/lisp-dir t "\\`setup-.*\\.el\\'"))))
+    (when (and (file-exists-p org-file) modules)
+      (let ((org-mtime (file-attribute-modification-time
+                        (file-attributes org-file))))
+        (when (seq-some
+               (lambda (el)
+                 (time-less-p (file-attribute-modification-time
+                               (file-attributes el))
+                              org-mtime))
+               modules)
+          (require 'org)
+          (require 'ob-tangle)
+          (message "config.org changed -- re-tangling...")
+          (org-babel-tangle-file org-file))))))
 
 (emacs.d/maybe-tangle-config)
 
-;; ---------------------------------------------------------------------------
-;; Load the modules
-;; ---------------------------------------------------------------------------
-;;
-;; Order matters in a few places:
-;;   * `setup-memory'       -- enable gcmh ASAP so it tunes the GC during the
-;;                             rest of the load,
-;;   * `setup-ui'           -- theme + font, so we look right while later
-;;                             modules load,
-;;   * `setup-editor'       -- core editing behaviour and built-in tweaks,
-;;   * `setup-completion'   -- vertico/marginalia/orderless/consult/corfu,
-;;   * `setup-prog'         -- eglot, flymake, eldoc, treesit,
-;;   * `setup-magit'        -- git porcelain,
-;;   * `setup-tramp'        -- remote editing tweaks,
-;;   * `setup-terminal'     -- vterm + tab-bar + dynamic tab title,
-;;   * `setup-ssh-sessions' -- saved SSH sessions opened in vterm tabs,
-;;   * `setup-ssh-tunnels'  -- tunnel manager with toggle on/off.
 (require 'setup-memory)
 (require 'setup-ui)
 (require 'setup-editor)
