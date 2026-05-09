@@ -136,15 +136,18 @@
 ;; ---------------------------------------------------------------------------
 ;;
 ;; Order matters in a few places:
-;;   * `setup-memory'    -- enable gcmh ASAP so it tunes the GC during the
-;;                          rest of the load,
-;;   * `setup-ui'        -- theme + font, so we look right while later
-;;                          modules load,
-;;   * `setup-editor'    -- core editing behaviour and built-in tweaks,
-;;   * `setup-completion'-- vertico/marginalia/orderless/consult/corfu,
-;;   * `setup-prog'      -- eglot, flymake, eldoc, treesit,
-;;   * `setup-magit'     -- git porcelain,
-;;   * `setup-tramp'     -- remote editing tweaks.
+;;   * `setup-memory'       -- enable gcmh ASAP so it tunes the GC during the
+;;                             rest of the load,
+;;   * `setup-ui'           -- theme + font, so we look right while later
+;;                             modules load,
+;;   * `setup-editor'       -- core editing behaviour and built-in tweaks,
+;;   * `setup-completion'   -- vertico/marginalia/orderless/consult/corfu,
+;;   * `setup-prog'         -- eglot, flymake, eldoc, treesit,
+;;   * `setup-magit'        -- git porcelain,
+;;   * `setup-tramp'        -- remote editing tweaks,
+;;   * `setup-terminal'     -- vterm + tab-bar + dynamic tab title,
+;;   * `setup-ssh-sessions' -- saved SSH sessions opened in vterm tabs,
+;;   * `setup-ssh-tunnels'  -- tunnel manager with toggle on/off.
 (require 'setup-memory)
 (require 'setup-ui)
 (require 'setup-editor)
@@ -152,5 +155,8 @@
 (require 'setup-prog)
 (require 'setup-magit)
 (require 'setup-tramp)
+(require 'setup-terminal)
+(require 'setup-ssh-sessions)
+(require 'setup-ssh-tunnels)
 
 ;;; init.el ends here
