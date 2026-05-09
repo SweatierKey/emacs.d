@@ -89,11 +89,50 @@
 
 (package-initialize)
 
-;; First-run bootstrap: refresh the archive list if we have never done so.
-;; We *don't* refresh on every boot -- it's slow and unnecessary.  Run
-;; `M-x package-refresh-contents' manually when you want fresh metadata.
-(unless package-archive-contents
-  (package-refresh-contents))
+;; ---------------------------------------------------------------------------
+;; Refresh package metadata when stale
+;; ---------------------------------------------------------------------------
+;;
+;; Refreshing on every boot is slow (one HTTPS round-trip per archive),
+;; but never refreshing is worse: MELPA / NonGNU prune old tarballs on a
+;; rolling basis, so a `use-package' call may try to install
+;; `magit-3.4.9.tar' from a metadata snapshot taken weeks ago when in
+;; reality the server now only has `magit-4.0.1.tar'.  The result is the
+;; classic "Not found" error during boot.
+;;
+;; The compromise: refresh automatically when the local archive cache is
+;; missing OR older than `emacs.d/package-refresh-stale-days' days.
+;; That keeps boots fast in the common case (cache is fresh enough)
+;; while preventing the stale-metadata trap.
+(defcustom emacs.d/package-refresh-stale-days 7
+  "How many days the package archive cache is allowed to age before we
+auto-refresh it on boot.  Set to 0 to refresh on every boot, or to a
+very large number to disable automatic refreshes (you'll have to run
+`M-x package-refresh-contents' yourself when packages start failing
+to install)."
+  :type 'integer
+  :group 'emacs.d)
+
+(defun emacs.d/package-refresh-if-stale ()
+  "Refresh `package-archive-contents' if the local cache is missing or
+older than `emacs.d/package-refresh-stale-days' days."
+  (let* ((archive-dir (expand-file-name "archives" package-user-dir))
+         ;; We pick the GNU archive-contents file as the "freshness witness"
+         ;; -- it always exists once any refresh has run, regardless of
+         ;; which other archives are configured.
+         (witness     (expand-file-name "gnu/archive-contents" archive-dir))
+         (stale-p     (or (not (file-exists-p witness))
+                          (time-less-p
+                           (file-attribute-modification-time
+                            (file-attributes witness))
+                           (time-subtract (current-time)
+                                          (days-to-time
+                                           emacs.d/package-refresh-stale-days))))))
+    (when stale-p
+      (message "Package archives are stale; refreshing...")
+      (package-refresh-contents))))
+
+(emacs.d/package-refresh-if-stale)
 
 ;; `use-package' is bundled with Emacs 29+, so we just require it.  The
 ;; helper variables below make the rest of the config more concise.
