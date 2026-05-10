@@ -63,10 +63,10 @@ installed manually -- see [[#prog][Programming language support]] and
 │   ├── setup-magit.el         Magit
 │   ├── setup-tramp.el         Remote editing over SSH
 │   ├── setup-terminal.el      vterm + tab-bar + dynamic tab title
-│   ├── setup-ssh-sessions.el  Saved SSH sessions opened in vterm tabs
+│   ├── setup-ssh-sessions.el  Open SSH connections in vterm tabs
 │   └── setup-ssh-tunnels.el   Tunnel manager (start/stop port forwards)
 ├── var/                Generated state: backups, auto-saves, tramp cache,
-│                       ssh-sessions.el and ssh-tunnels.el (gitignored)
+│                       ssh-tunnels.el (gitignored)
 ├── elpa/               Installed packages (gitignored)
 └── eln-cache/          Native-comp cache (gitignored)
 #+end_example
@@ -1217,8 +1217,8 @@ Refuses to close the last surviving tab."
 :CUSTOM_ID: ssh-sessions
 :END:
 
-A small "session manager" inspired by the saved sessions of
-MobaXterm, Termius or PuTTY -- built natively on top of [[#terminal][vterm + tab-bar]].
+A small launcher that spawns SSH connections inside [[#terminal][vterm + tab-bar]],
+inspired by the saved-session lists of MobaXterm, Termius or PuTTY.
 
 The connection method is plain ~ssh~ inside vterm, *not* TRAMP.  The
 real-life flow involves CyberArk PSMP and other interactive prompts
@@ -1226,35 +1226,49 @@ real-life flow involves CyberArk PSMP and other interactive prompts
 TRAMP's model; we want the saving in not having to remember the
 host, user and port -- not in trying to script the credentials.
 
-** Storage and schema
+** Single source of truth: =~/.ssh/config=
 :PROPERTIES:
-:CUSTOM_ID: ssh-sessions-schema
+:CUSTOM_ID: ssh-sessions-source
 :END:
 
-Sessions live in =var/ssh-sessions.el= (gitignored).  Each entry is
-a plist; the file contains a single Lisp form -- a list of plists.
+There is no Emacs-specific session storage.  The candidate list comes
+straight from your OpenSSH client config, exactly the same file used
+by ~ssh~, ~scp~, ~rsync~, ~git~, TRAMP and every other tool on the
+system.  Adding a host once teaches every client at the same time.
 
-Recognised fields:
+How the parser works:
 
-| Field          | Required | Meaning                                                       |
-|----------------+----------+---------------------------------------------------------------|
-| ~:name~        | yes      | Unique label.  Becomes the initial tab title.                 |
-| ~:host~        | yes      | Remote hostname or IP.                                        |
-| ~:user~        | no       | Remote username.  Defaults to the local user.                 |
-| ~:port~        | no       | TCP port.  Default 22.                                        |
-| ~:command~     | no       | Full command override; if present, ~:host~/~:user~/~:port~ are ignored. Useful for ProxyJump chains, Kerberized wrappers, custom CyberArk launchers. |
-| ~:group~       | no       | Free-form classification for completing-read annotations.     |
-| ~:description~ | no       | Free-form note.                                               |
+- All ~Host~ stanzas in =~/.ssh/config= are scanned.
+- Each token on a ~Host~ line is treated as one alias, so
+  =Host alias1 alias2= contributes both names.
+- Tokens containing ~*~, ~?~ or ~!~ are skipped: these are /patterns/,
+  not connectable aliases.  They keep applying transparently when you
+  do connect (e.g. an ~IdentityFile~ under ~Host lx*~ is honoured for
+  any =lx...= you type), but they should not appear as picker entries.
+- ~Include~ directives are not followed -- if you split your config
+  across files, point the defcustom ~emacs.d/ssh-config-file~ at the
+  master one or extend the parser.
 
-Example:
+The picker accepts free-form input: typing a host that isn't in the
+list (a brand-new alias, an IP, a Hostname-like string) connects
+through ~ssh~ all the same.  Any ~Host *~ defaults you have set still
+apply.  This makes "try a new host quickly" a one-keystroke flow.
 
-#+begin_src emacs-lisp :tangle no
-(:name        "prod-bastion-1"
- :host        "bastion1.acme.com"
- :user        "myuser"
- :port        22
- :group       "Production"
- :description "CyberArk PSMP entry to prod tier")
+For per-host options that previously needed an Emacs schema,
+=~/.ssh/config= already covers everything, e.g.:
+
+#+begin_src conf-space :tangle no
+Host my-bastion
+    HostName  bastion.example.com
+    User      myuser
+    Port      2222
+    IdentityFile ~/.ssh/id_acme
+    ProxyJump   psmp-gateway
+    # Run a command immediately after authentication.  Combined with
+    # `RequestTTY force', this is the OpenSSH-native way to land you
+    # straight in a privileged shell -- no Lisp post-command needed.
+    RemoteCommand sudo su -
+    RequestTTY    force
 #+end_src
 
 ** Bindings
@@ -1262,15 +1276,16 @@ Example:
 :CUSTOM_ID: ssh-sessions-keys
 :END:
 
-| Key       | Command                          | Purpose                                                 |
-|-----------+----------------------------------+---------------------------------------------------------|
-| ~C-c s s~ | ~emacs.d/ssh-sessions-open~      | Pick a session and open it in a new tab                 |
-| ~C-c s a~ | ~emacs.d/ssh-sessions-add~       | Define a new session interactively                      |
-| ~C-c s e~ | ~emacs.d/ssh-sessions-edit~      | Open the storage file for direct editing                |
+| Key       | Command                     | Purpose                                                           |
+|-----------+-----------------------------+-------------------------------------------------------------------|
+| ~C-c s s~ | ~emacs.d/ssh-sessions-open~ | Pick a host (or type one) and open it in a new tab                |
+| ~C-c s a~ | ~emacs.d/ssh-sessions-add~  | Append a ~Host~ scaffold at the end of =~/.ssh/config=, point ready |
+| ~C-c s e~ | ~emacs.d/ssh-sessions-edit~ | Open =~/.ssh/config= for free-form editing                          |
 
-The completing-read prompt offers Vertico annotations showing host,
-group and description -- so all three are searchable with Orderless
-tokens.
+The "add" command is intentionally ergonomic-but-undoable: it inserts
+a commented template, leaves point right after ~Host~, and trusts the
+user to either fill it in and save -- or close the buffer without
+saving to discard the scaffold entirely.
 
 ** Lifecycle
 :PROPERTIES:
@@ -1279,191 +1294,108 @@ tokens.
 
 Opening a session:
 
-1. Creates a new tab and renames it to the session ~:name~ /
-   immediately/, so the bastion label is visible before SSH has even
-   authenticated.
-2. Spawns a vterm whose shell is the synthesised ~ssh~ command (or
-   the explicit ~:command~ override).
+1. Creates a new tab and renames it to the chosen alias /immediately/,
+   so the label is visible before SSH has even authenticated.
+2. Spawns a vterm whose shell is ~ssh -t <alias>~.  The ~-t~ forces a
+   PTY so any ~RemoteCommand~ in the config runs interactively.
 3. Marks the buffer with ~emacs.d/vterm-bastion-name~ and
    ~emacs.d/vterm-tab-name~ so [[#terminal-dynamic-title][the title machinery]] can keep the tab
-   in sync with the prompt.
+   in sync with the prompt (e.g. the alias becomes ~alias: realhost~
+   once the shell prompt appears).
 4. Installs the buffer-local ~kill-buffer-hook~ that closes the tab
    when the session is killed (see [[#terminal-closing][Closing sessions]]).
 
 #+begin_src emacs-lisp :tangle lisp/setup-ssh-sessions.el
-;;; setup-ssh-sessions.el --- Saved SSH sessions in vterm tabs -*- lexical-binding: t; -*-
+;;; setup-ssh-sessions.el --- Open SSH connections in vterm tabs -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;; See config.org, section "SSH sessions".
 
 ;;; Code:
 
-(require 'cl-lib)
 (require 'subr-x)
 (require 'tab-bar)
 
-(defcustom emacs.d/ssh-sessions-file
-  (expand-file-name "var/ssh-sessions.el" user-emacs-directory)
-  "File where SSH session definitions are persisted."
+(defcustom emacs.d/ssh-config-file
+  (expand-file-name "~/.ssh/config")
+  "OpenSSH client configuration file used as the source of host aliases."
   :type 'file :group 'emacs.d)
 
-(defvar emacs.d/ssh-sessions nil
-  "In-memory list of SSH session plists.")
-
-(defun emacs.d/ssh-sessions--seed-file (file)
-  "Write a starter list with one example session to FILE."
-  (make-directory (file-name-directory file) t)
-  (with-temp-file file
-    (insert ";; -*- lexical-binding: t; -*-\n"
-            ";; SSH sessions for `setup-ssh-sessions'.\n"
-            ";; Each entry is a plist; see config.org for the schema.\n\n"
-            "(\n"
-            "  (:name \"example-bastion\"\n"
-            "   :host \"bastion.example.com\"\n"
-            "   :user \"myuser\"\n"
-            "   :port 22\n"
-            "   :group \"Examples\"\n"
-            "   :description \"Sample entry; replace me.\")\n"
-            ")\n")))
-
-(defun emacs.d/ssh-sessions-load ()
-  "Load `emacs.d/ssh-sessions' from `emacs.d/ssh-sessions-file'."
-  (let ((file emacs.d/ssh-sessions-file))
-    (unless (file-exists-p file)
-      (emacs.d/ssh-sessions--seed-file file))
-    (with-temp-buffer
-      (insert-file-contents file)
-      (goto-char (point-min))
-      (setq emacs.d/ssh-sessions (read (current-buffer))))))
-
-(defun emacs.d/ssh-sessions-save ()
-  "Write `emacs.d/ssh-sessions' back to disk as pretty-printed Lisp."
-  (let ((file emacs.d/ssh-sessions-file))
-    (make-directory (file-name-directory file) t)
-    (with-temp-file file
-      (insert ";; -*- lexical-binding: t; -*-\n"
-              ";; SSH sessions for `setup-ssh-sessions'.\n\n")
-      (let ((print-length nil) (print-level nil))
-        (pp emacs.d/ssh-sessions (current-buffer))))))
-
-(defun emacs.d/ssh-sessions--ensure-loaded ()
-  (unless emacs.d/ssh-sessions (emacs.d/ssh-sessions-load)))
-
-(defun emacs.d/ssh-sessions--find (name)
-  (cl-find name emacs.d/ssh-sessions
-           :key  (lambda (s) (plist-get s :name))
-           :test #'string-equal))
-
-(defun emacs.d/ssh-sessions--build-command (session)
-  "Return the shell command string used to launch SESSION.
-If SESSION provides a `:command' field it wins verbatim, otherwise we
-synthesise a plain `ssh [-p PORT] [USER@]HOST' invocation."
-  (or (plist-get session :command)
-      (let ((host (plist-get session :host))
-            (user (plist-get session :user))
-            (port (plist-get session :port))
-            (parts '("ssh")))
-        (when port
-          (setq parts (append parts (list "-p" (format "%s" port)))))
-        (setq parts (append parts (list (if user
-                                            (format "%s@%s" user host)
-                                          host))))
-        (mapconcat #'identity parts " "))))
-
-(defun emacs.d/ssh-sessions--annotation (cand)
-  "Annotation function passed to `completing-read'."
-  (when-let ((session (emacs.d/ssh-sessions--find cand)))
-    (let ((host  (plist-get session :host))
-          (group (plist-get session :group))
-          (descr (plist-get session :description)))
-      (concat
-       (when host  (format "  %s" host))
-       (when group (format "  [%s]" group))
-       (when descr (format "  -- %s" descr))))))
-
-(defun emacs.d/ssh-sessions--read-optional (prompt)
-  "Read a string for PROMPT and return it, or nil if empty."
-  (let ((s (read-string prompt)))
-    (and (not (string-empty-p s)) s)))
-
-(defun emacs.d/ssh-sessions--reload-after-save ()
-  "Buffer-local `after-save-hook' for the storage file: reload sessions."
-  (when (and buffer-file-name
-             (string-equal (expand-file-name buffer-file-name)
-                           (expand-file-name emacs.d/ssh-sessions-file)))
-    (emacs.d/ssh-sessions-load)
-    (message "SSH sessions reloaded (%d entries)."
-             (length emacs.d/ssh-sessions))))
+(defun emacs.d/ssh-sessions--parse-aliases (file)
+  "Return concrete host aliases declared in FILE, omitting wildcards.
+Patterns containing `*', `?' or `!' are skipped: they are matched by
+ssh at connect time but cannot themselves be connected to, so they
+must not appear as picker candidates."
+  (when (file-readable-p file)
+    (let (aliases)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "^[ \t]*Host[ \t]+\\(.+?\\)[ \t]*$" nil t)
+          (dolist (token (split-string (match-string 1) "[ \t]+" t))
+            (unless (string-match-p "[*?!]" token)
+              (push token aliases)))))
+      (delete-dups (nreverse aliases)))))
 
 ;;;###autoload
-(defun emacs.d/ssh-sessions-open (name)
-  "Open the saved SSH session NAME in a new tab running vterm."
+(defun emacs.d/ssh-sessions-open (host)
+  "Open an SSH session to HOST in a fresh tab running vterm.
+Candidates come from `emacs.d/ssh-config-file' but any string is
+accepted, so a brand-new alias (or a literal hostname/IP) connects
+straight away through whatever defaults `~/.ssh/config' provides."
   (interactive
-   (progn
-     (emacs.d/ssh-sessions--ensure-loaded)
-     (unless emacs.d/ssh-sessions
-       (user-error "No SSH sessions defined; use M-x emacs.d/ssh-sessions-add"))
-     (let* ((completion-extra-properties
-             '(:annotation-function emacs.d/ssh-sessions--annotation))
-            (names (mapcar (lambda (s) (plist-get s :name))
-                           emacs.d/ssh-sessions)))
-       (list (completing-read "SSH session: " names nil t)))))
-  (emacs.d/ssh-sessions--ensure-loaded)
-  (let* ((session (emacs.d/ssh-sessions--find name))
-         (cmd     (and session (emacs.d/ssh-sessions--build-command session)))
-         (buf-name (format "*ssh: %s*" name)))
-    (unless session (user-error "Session %S not found" name))
-
+   (let ((aliases (emacs.d/ssh-sessions--parse-aliases
+                   emacs.d/ssh-config-file)))
+     (list (completing-read "SSH host: " aliases nil nil))))
+  (when (string-empty-p host)
+    (user-error "No host given"))
+  (let ((cmd      (format "ssh -t %s" host))
+        (buf-name (format "*ssh: %s*" host)))
     (tab-bar-new-tab)
-    (tab-bar-rename-tab name)
+    (tab-bar-rename-tab host)
 
     (require 'vterm)
-    (let ((vterm-shell        cmd)
-          (vterm-buffer-name  buf-name))
+    (let ((vterm-shell       cmd)
+          (vterm-buffer-name buf-name))
       (vterm vterm-buffer-name))
 
     (with-current-buffer (current-buffer)
-      (setq-local emacs.d/vterm-bastion-name name
-                  emacs.d/vterm-tab-name     name)
+      (setq-local emacs.d/vterm-bastion-name host
+                  emacs.d/vterm-tab-name     host)
       (add-hook 'kill-buffer-hook
                 #'emacs.d/vterm-close-tab-on-kill nil t))
 
     (force-mode-line-update t)))
 
 ;;;###autoload
-(defun emacs.d/ssh-sessions-add ()
-  "Interactively define a new SSH session and persist it."
+(defun emacs.d/ssh-sessions-edit ()
+  "Open `emacs.d/ssh-config-file' for direct editing."
   (interactive)
-  (emacs.d/ssh-sessions--ensure-loaded)
-  (let* ((name (read-string "Session name (unique): ")))
-    (when (emacs.d/ssh-sessions--find name)
-      (user-error "A session named %S already exists" name))
-    (let* ((host  (read-string "Host: "))
-           (user  (emacs.d/ssh-sessions--read-optional "User (RET to skip): "))
-           (port  (let ((p (read-string "Port (RET for default 22): ")))
-                    (and (not (string-empty-p p)) (string-to-number p))))
-           (group (emacs.d/ssh-sessions--read-optional "Group (RET to skip): "))
-           (descr (emacs.d/ssh-sessions--read-optional
-                   "Description (RET to skip): "))
-           (session (apply #'list
-                           :name name :host host
-                           (append
-                            (when user  (list :user user))
-                            (when port  (list :port port))
-                            (when group (list :group group))
-                            (when descr (list :description descr))))))
-      (setq emacs.d/ssh-sessions (append emacs.d/ssh-sessions (list session)))
-      (emacs.d/ssh-sessions-save)
-      (message "Session %S saved.  M-x emacs.d/ssh-sessions-open to launch."
-               name))))
+  (find-file emacs.d/ssh-config-file))
 
 ;;;###autoload
-(defun emacs.d/ssh-sessions-edit ()
-  "Open the session storage file for direct Lisp editing."
+(defun emacs.d/ssh-sessions-add ()
+  "Append a `Host' template at the end of `emacs.d/ssh-config-file'.
+Point lands right after `Host ', ready for the alias name.  The
+template lines are pre-inserted but mostly commented out -- save to
+keep, kill the buffer without saving to discard the scaffold entirely."
   (interactive)
-  (emacs.d/ssh-sessions--ensure-loaded)
-  (find-file emacs.d/ssh-sessions-file)
-  (add-hook 'after-save-hook #'emacs.d/ssh-sessions--reload-after-save nil t))
+  (find-file emacs.d/ssh-config-file)
+  (goto-char (point-max))
+  (unless (bolp) (insert "\n"))
+  (let ((stanza-start (point)))
+    (insert "\nHost \n"
+            "    HostName \n"
+            "    User \n"
+            "    # Port 22\n"
+            "    # IdentityFile ~/.ssh/id_rsa\n"
+            "    # ProxyJump some-bastion\n"
+            "    # RemoteCommand sudo su -\n"
+            "    # RequestTTY force\n")
+    (goto-char stanza-start)
+    (forward-line 1)
+    (end-of-line)))
 
 (global-set-key (kbd "C-c s s") #'emacs.d/ssh-sessions-open)
 (global-set-key (kbd "C-c s a") #'emacs.d/ssh-sessions-add)

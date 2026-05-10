@@ -46,7 +46,7 @@ prose + code in the same place.
 │   ├── setup-magit.el        Git porcelain
 │   ├── setup-tramp.el        Remote editing over SSH
 │   ├── setup-terminal.el     vterm + tab-bar + dynamic tab title
-│   ├── setup-ssh-sessions.el Saved SSH sessions, opened in vterm tabs
+│   ├── setup-ssh-sessions.el Open SSH connections in vterm tabs (uses ~/.ssh/config)
 │   └── setup-ssh-tunnels.el  Tunnel manager (start/stop port forwards)
 ├── var/                Generated state: backups, auto-saves, tramp cache
 ├── elpa/               Installed packages (gitignored)
