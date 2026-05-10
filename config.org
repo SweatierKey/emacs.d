@@ -392,6 +392,19 @@ modern one.
   external tools (webpack, vim, file watchers) and are useful only in
   multi-user setups.
 
+  *Security caveat:* both ~var/auto-save/~ (in-progress edit
+  snapshots) and ~var/backups/~ (pre-save copies of every file you
+  touch) hold *cleartext* copies of buffer content, including any
+  file you opened that contained secrets.  They live under your
+  home directory so the OS file permissions are the only barrier.
+  No automatic expiry: prune periodically with
+  =rm -rf ~/.emacs.d/var/auto-save/* ~/.emacs.d/var/backups/*=.
+  =auto-save-visited-mode= -- the more aggressive variant that
+  rewrites the visited file in place -- is intentionally /not/
+  enabled, and TRAMP buffers also have ~remote-file-name-inhibit-auto-save-visited~
+  set so it could not silently push to a remote share even if it
+  were turned on.
+
 - *Persistent state.*  Built-in but off by default: ~recentf~ (recent
   files list), ~saveplace~ (point position across sessions),
   ~savehist~ (minibuffer history, search rings, kill ring).
@@ -1024,28 +1037,39 @@ during normal editing.  New tabs land on ~*scratch*~.
 :CUSTOM_ID: terminal-dynamic-title
 :END:
 
-Three buffer-local variables drive the title machinery:
+Five buffer-local variables drive the title machinery:
 
 - ~emacs.d/vterm-bastion-name~ -- string set once when the session is
   opened (by [[#ssh-sessions][setup-ssh-sessions]]).  Static for the lifetime of the
-  session.  Used as the prefix of the tab title.
+  session.  Used as the prefix of the tab title and as the first
+  hop of the TRAMP chain.
 - ~emacs.d/vterm-current-host~ -- updated by parsing the latest
   visible shell prompt against ~emacs.d/vterm-prompt-host-regexp~.
   May be nil while the prompt is still being drawn.
+- ~emacs.d/vterm-current-user~ -- user name captured from the same
+  prompt.  Lets the TRAMP path chain an extra ~|sudo:USER~ hop when
+  the session has elevated/deescalated on the target via ~sudo su -~.
+- ~emacs.d/vterm-current-path~ -- working directory captured from the
+  same prompt.  Optional: nil when PS1 does not expose a cwd.
 - ~emacs.d/vterm-tab-name~ -- the tab title last installed.  Stored
   so the right tab can be located by name when the host changes,
   even if the user has switched to a different tab in the meantime.
 
-The default regexp matches the typical Linux PS1 forms:
+The default regexp is anchored at column zero and captures user
+(group 1), host (group 2) and optional cwd (group 3):
 
 #+begin_example
-[user@host pwd]$
- user@host:pwd$
- user@host pwd>
+user@host$              # user + host
+user@host:~/foo$        # user + host + path
+root@host:/etc#         # root shell on host (prompt char `#')
+oracle@target:/u01/app$ # after `sudo su - oracle' on a target host
 #+end_example
 
 No remote ~.bashrc~ modification is required -- we read what is
-already on screen.
+already on screen.  PS1 shapes that do not start at column zero
+or do not end with one of ~$ # % >~ won't match the default
+regexp; customise ~emacs.d/vterm-prompt-host-regexp~ if your
+environment uses an unusual prompt.
 
 The strategy is to /not/ intercept ~tab-bar-tab-name-function~ (which
 is invoked for every tab on every redraw and forces a 0-arg
@@ -1053,6 +1077,82 @@ signature), and instead explicitly call ~tab-bar-rename-tab~
 whenever the session detects a new host.  The relevant tab is
 located by name through the helper ~emacs.d/tab-bar-rename-tab-by-name~,
 so the rename works regardless of which tab is currently selected.
+
+The buffer name is renamed too -- but with the cwd appended:
+
+#+begin_example
+tab    →  bast-prod: lxdoma001                       (stable identity)
+buffer → *ssh: bast-prod: lxdoma001 — ~/etc/foo*     (with current cwd)
+#+end_example
+
+Rationale: the tab is the session's stable identity (used to
+navigate between sessions), so it changes only when the host you're
+logged into changes -- a relatively rare event (an extra ~ssh~ hop,
+a ~sudo su~ that bumps the prompt).  The cwd, on the other hand,
+moves on every ~cd~ and belongs in the place Emacs already reserves
+for "where am I now" -- the mode-line / ~C-x b~ list, i.e. the
+buffer name.  This keeps the tab bar from jittering horizontally
+while you wander around the filesystem.
+
+To prevent vterm from also renaming the buffer when the remote
+shell sends an OSC title escape (which would clash with our manual
+rename), session vterms set ~vterm-buffer-name-string~ to ~nil~
+buffer-locally.  Regular vterms opened with ~C-c v~ keep the
+default ~"vterm: %s"~ title-driven name.
+
+** TRAMP path tracking
+:PROPERTIES:
+:CUSTOM_ID: terminal-tramp
+:END:
+
+Once user, host and cwd are extracted from the prompt we have
+*enough* to assemble the TRAMP path pointing at exactly the same
+remote location -- a strict superset of what the title machinery
+needs.  In an environment with CyberArk PSMP this means a
+multi-hop chain (~ssh~ to the bastion, ~sudo~ into root,
+optionally another ~ssh~ to a target host, optionally another
+~sudo~ into a different user on the target).  Empirically tested
+against a CyberArk-fronted bastion with ~RemoteCommand sudo -i~ +
+~RequestTTY yes~ in its ssh_config entry: TRAMP can use the same
+alias as the interactive session, no separate "-tramp" variant is
+required.
+
+Resulting TRAMP path shapes (with default
+~emacs.d/vterm-tramp-sudo-user = "root"~):
+
+#+begin_example
+On bastion as root (after auto sudo -i):
+    /ssh:BASTION|sudo:root:CWD
+
+On a target host as root (manual `ssh TARGET`):
+    /ssh:BASTION|sudo:root|ssh:TARGET:CWD
+
+On target as oracle (after `sudo su - oracle`):
+    /ssh:BASTION|sudo:root|ssh:TARGET|sudo:oracle:CWD
+#+end_example
+
+Two modes of using this:
+
+- *Auto-sync (default, ~emacs.d/vterm-tramp-auto-sync = t~)*: every
+  time the prompt detects a host / user / cwd change, the vterm
+  buffer's ~default-directory~ is updated to the matching TRAMP
+  path.  ~C-x C-f~ inside that buffer now starts at the remote
+  location, as does dired, ~M-!~, ~compile~, ~magit-status~ and
+  every other command that reads ~default-directory~.  Powerful
+  but invasive: anything you do *from that buffer* "thinks" it's
+  on the remote machine.
+
+- *Manual mode (set ~emacs.d/vterm-tramp-auto-sync~ to nil)*:
+  ~default-directory~ is left alone.  A dedicated command,
+  ~emacs.d/vterm-find-file-remote~ (bound to ~C-c f~ in
+  vterm-mode), computes the TRAMP path on demand and invokes
+  ~find-file~ with it -- the only command that crosses to the
+  remote, everything else stays local.
+
+The auto-sync code path is conservative: it only runs in *session*
+vterms (i.e. those with ~emacs.d/vterm-tab-name~ set), it only
+recomputes when host / user / cwd actually change, and it bails
+out silently if any of the three are still unknown.
 
 ** Closing sessions
 :PROPERTIES:
@@ -1099,7 +1199,8 @@ Two related conveniences for the SSH workflow:
   :bind
   (("C-c v" . vterm)
    :map vterm-mode-map
-        ("C-c C-t" . vterm-copy-mode)))
+        ("C-c C-t" . vterm-copy-mode)
+        ("C-c f"   . emacs.d/vterm-find-file-remote)))
 
 (use-package tab-bar
   :ensure nil
@@ -1122,25 +1223,102 @@ Set by `setup-ssh-sessions' at session creation; static thereafter.")
 (defvar-local emacs.d/vterm-current-host nil
   "Hostname extracted from the most recent visible shell prompt.")
 
+(defvar-local emacs.d/vterm-current-user nil
+  "User name extracted from the most recent visible shell prompt.
+Lets the TRAMP path chain an extra `|sudo:USER' hop when the
+session has elevated/deescalated via `sudo su -' on the target.")
+
+(defvar-local emacs.d/vterm-current-path nil
+  "Working directory extracted from the most recent visible shell prompt.
+Nil when PS1 does not expose a cwd, or before the first prompt has
+been drawn.")
+
 (defvar-local emacs.d/vterm-tab-name nil
   "Last tab title applied for this vterm buffer.
 Used to find the right tab to rename when the prompt host changes.")
 
 (defcustom emacs.d/vterm-prompt-host-regexp
-  "[][:alnum:]_.-]*@\\([[:alnum:]_.-]+\\)[ :]"
-  "Regexp used to extract the current hostname from a shell prompt.
-Capture group 1 must be the hostname."
+  "^\\([[:alnum:]_.-]+\\)@\\([[:alnum:]_.-]+\\)\\(?::\\([^[:space:]\n]+?\\)\\)?[ \t]*[$#%>]"
+  "Regexp used to extract user, host and cwd from the visible shell prompt.
+Capture groups in order: USER (group 1), HOST (group 2), CWD
+(group 3, optional).  The regexp is anchored at column zero, so a
+non-standard PS1 that indents the prompt will not match -- customise
+this if your environment is unusual."
   :type 'regexp :group 'emacs.d)
 
-(defun emacs.d/vterm-extract-prompt-host ()
-  "Return the hostname captured by the most recent prompt-like match."
+(defcustom emacs.d/vterm-tramp-sudo-user "root"
+  "User TRAMP must sudo into immediately after the ssh hop to the bastion.
+Mirrors the `RemoteCommand sudo -i' that the interactive ssh_config
+typically runs on a CyberArk-style bastion: the interactive shell is
+already root, but TRAMP's own ssh invocation needs the equivalent
+step expressed as a hop.  Set to nil to disable."
+  :type '(choice (const :tag "No sudo on bastion" nil) string)
+  :group 'emacs.d)
+
+(defcustom emacs.d/vterm-tramp-bastion-user "root"
+  "User the session is expected to be running as after the bastion sudo.
+Used to decide whether an *extra* `|sudo:USER' hop is needed on
+top of the basic chain: if the prompt's user differs from this
+(typically because of `sudo su - oracle' on the target host) the
+chain grows by one final sudo hop to reach that user."
+  :type 'string :group 'emacs.d)
+
+(defcustom emacs.d/vterm-tramp-auto-sync t
+  "When non-nil, continuously sync `default-directory' of session vterms
+to a TRAMP path matching the prompt-derived remote location.  This
+makes `C-x C-f', dired, magit, `compile' and `M-!' from the vterm
+buffer all target the remote machine.  Set to nil to leave
+`default-directory' alone and cross to the remote only on demand,
+through `emacs.d/vterm-find-file-remote' (bound to `C-c f' in
+vterm-mode)."
+  :type 'boolean :group 'emacs.d)
+
+(defun emacs.d/vterm-extract-prompt-context ()
+  "Return (USER HOST PATH) from the most recent prompt, or nil.
+Each element may be nil if its capture group did not match.  Scans
+back at most 50 lines from `point-max'."
   (save-excursion
     (goto-char (point-max))
     (let ((window-start (max (point-min)
                              (save-excursion (forward-line -50) (point)))))
       (when (re-search-backward emacs.d/vterm-prompt-host-regexp
                                 window-start t)
-        (match-string-no-properties 1)))))
+        (list (match-string-no-properties 1)
+              (match-string-no-properties 2)
+              (and (match-beginning 3) (match-string-no-properties 3)))))))
+
+(defun emacs.d/vterm--tramp-default-directory ()
+  "Compose the TRAMP path matching the current session prompt, or nil.
+Builds `/ssh:BASTION[|sudo:U1][|ssh:TARGET][|sudo:U2]:CWD/' from
+the buffer-local state.  Returns nil when bastion, host or cwd are
+still unknown (so callers can skip the sync gracefully)."
+  (let ((bastion emacs.d/vterm-bastion-name)
+        (host    emacs.d/vterm-current-host)
+        (user    emacs.d/vterm-current-user)
+        (path    emacs.d/vterm-current-path))
+    (when (and bastion host path)
+      (let* ((sudo-on-bastion
+              (and emacs.d/vterm-tramp-sudo-user
+                   (format "|sudo:%s" emacs.d/vterm-tramp-sudo-user)))
+             (extra-ssh
+              (and (not (string-equal host bastion))
+                   (format "|ssh:%s" host)))
+             (extra-sudo
+              ;; Add another sudo only when the prompt's user is not
+              ;; the post-bastion default -- typically because of a
+              ;; `sudo su - oracle' on the target.  Only meaningful
+              ;; once we have hopped past the bastion.
+              (and user
+                   extra-ssh
+                   (not (string-equal
+                         user emacs.d/vterm-tramp-bastion-user))
+                   (format "|sudo:%s" user))))
+        (format "/ssh:%s%s%s%s:%s"
+                bastion
+                (or sudo-on-bastion "")
+                (or extra-ssh        "")
+                (or extra-sudo       "")
+                (file-name-as-directory path))))))
 
 (defun emacs.d/tab-bar-rename-tab-by-name (old-name new-name)
   "Rename the tab named OLD-NAME to NEW-NAME on the selected frame.
@@ -1155,25 +1333,69 @@ Returns non-nil on success, nil if no tab has OLD-NAME."
       (tab-bar-rename-tab new-name (1+ idx))
       t)))
 
+(defun emacs.d/vterm--compose-buffer-name (tab-name path)
+  "Return the buffer name to install for TAB-NAME (and optional PATH).
+Format: `*ssh: TAB-NAME[ — PATH]*'."
+  (if path
+      (format "*ssh: %s — %s*" tab-name path)
+    (format "*ssh: %s*" tab-name)))
+
 (defun emacs.d/vterm-update-current-host (&rest _ignored)
-  "Refresh the host derived from the prompt and rename the tab if needed.
-Hooked as `:after' advice on `vterm--filter'."
+  "Refresh user/host/path from the prompt and rename tab + buffer, then
+optionally sync `default-directory' to the matching TRAMP path.
+The tab name only tracks the *host* (stable identity of the SSH
+session), the buffer name additionally reflects the *cwd*, and the
+TRAMP-derived `default-directory' also tracks the current *user* --
+in increasing order of volatility.  Hooked as `:after' advice on
+`vterm--filter'."
   (when (derived-mode-p 'vterm-mode)
-    (let ((new-host (emacs.d/vterm-extract-prompt-host)))
-      (when (and new-host
-                 (not (equal new-host emacs.d/vterm-current-host)))
-        (setq-local emacs.d/vterm-current-host new-host)
-        (let* ((bastion      emacs.d/vterm-bastion-name)
-               (new-tab-name (if bastion
-                                 (format "%s: %s" bastion new-host)
-                               new-host)))
-          (when (and (bound-and-true-p tab-bar-mode)
-                     emacs.d/vterm-tab-name
-                     (not (string-equal new-tab-name
-                                        emacs.d/vterm-tab-name)))
-            (when (emacs.d/tab-bar-rename-tab-by-name
-                   emacs.d/vterm-tab-name new-tab-name)
-              (setq-local emacs.d/vterm-tab-name new-tab-name))))))))
+    (let* ((ctx      (emacs.d/vterm-extract-prompt-context))
+           (new-user (nth 0 ctx))
+           (new-host (nth 1 ctx))
+           (new-path (nth 2 ctx)))
+      (when new-host
+        (let ((host-changed (not (equal new-host emacs.d/vterm-current-host)))
+              (user-changed (not (equal new-user emacs.d/vterm-current-user)))
+              (path-changed (not (equal new-path emacs.d/vterm-current-path))))
+          (when host-changed (setq-local emacs.d/vterm-current-host new-host))
+          (when user-changed (setq-local emacs.d/vterm-current-user new-user))
+          (when path-changed (setq-local emacs.d/vterm-current-path new-path))
+          (when (and emacs.d/vterm-tab-name
+                     (or host-changed user-changed path-changed))
+            (let* ((bastion      emacs.d/vterm-bastion-name)
+                   (new-tab-name (if bastion
+                                     (format "%s: %s" bastion new-host)
+                                   new-host))
+                   (new-buf-name (emacs.d/vterm--compose-buffer-name
+                                  new-tab-name new-path)))
+              (when (and (bound-and-true-p tab-bar-mode)
+                         (not (string-equal new-tab-name
+                                            emacs.d/vterm-tab-name))
+                         (emacs.d/tab-bar-rename-tab-by-name
+                          emacs.d/vterm-tab-name new-tab-name))
+                (setq-local emacs.d/vterm-tab-name new-tab-name))
+              (unless (string-equal new-buf-name (buffer-name))
+                ;; `t' makes the new name unique on collision (e.g. two
+                ;; sessions land on the same alias + cwd at once).
+                (rename-buffer new-buf-name t))
+              (when emacs.d/vterm-tramp-auto-sync
+                (when-let ((td (emacs.d/vterm--tramp-default-directory)))
+                  (unless (string-equal td default-directory)
+                    (setq-local default-directory td)))))))))))
+
+;;;###autoload
+(defun emacs.d/vterm-find-file-remote ()
+  "Open `find-file' with `default-directory' bound to this session's
+TRAMP path.  Use when `emacs.d/vterm-tramp-auto-sync' is nil, or
+to cross to the remote just for this one command from a buffer
+whose `default-directory' is still local."
+  (interactive)
+  (let ((td (emacs.d/vterm--tramp-default-directory)))
+    (unless td
+      (user-error
+       "Cannot derive a TRAMP path: missing bastion/host/cwd for this session"))
+    (let ((default-directory td))
+      (call-interactively #'find-file))))
 
 (with-eval-after-load 'vterm
   (advice-add 'vterm--filter :after #'emacs.d/vterm-update-current-host))
@@ -1361,8 +1583,12 @@ straight away through whatever defaults `~/.ssh/config' provides."
       (vterm vterm-buffer-name))
 
     (with-current-buffer (current-buffer)
+      ;; Stop vterm from renaming the buffer on OSC title escapes:
+      ;; setup-terminal already does it from the prompt regex, and
+      ;; two competing renamers would race.
       (setq-local emacs.d/vterm-bastion-name host
-                  emacs.d/vterm-tab-name     host)
+                  emacs.d/vterm-tab-name     host
+                  vterm-buffer-name-string   nil)
       (add-hook 'kill-buffer-hook
                 #'emacs.d/vterm-close-tab-on-kill nil t))
 

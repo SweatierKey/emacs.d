@@ -53,8 +53,12 @@ straight away through whatever defaults `~/.ssh/config' provides."
       (vterm vterm-buffer-name))
 
     (with-current-buffer (current-buffer)
+      ;; Stop vterm from renaming the buffer on OSC title escapes:
+      ;; setup-terminal already does it from the prompt regex, and
+      ;; two competing renamers would race.
       (setq-local emacs.d/vterm-bastion-name host
-                  emacs.d/vterm-tab-name     host)
+                  emacs.d/vterm-tab-name     host
+                  vterm-buffer-name-string   nil)
       (add-hook 'kill-buffer-hook
                 #'emacs.d/vterm-close-tab-on-kill nil t))
 
