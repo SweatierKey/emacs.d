@@ -17,8 +17,7 @@
   :bind
   (("C-c v" . vterm)
    :map vterm-mode-map
-        ("C-c C-t" . vterm-copy-mode)
-        ("C-c f"   . emacs.d/vterm-find-file-remote)))
+        ("C-c C-t" . vterm-copy-mode)))
 
 (use-package tab-bar
   :ensure nil
@@ -56,30 +55,61 @@ been drawn.")
 Used to find the right tab to rename when the prompt host changes.")
 
 (defcustom emacs.d/vterm-prompt-host-regexp
-  "^\\([[:alnum:]_.-]+\\)@\\([[:alnum:]_.-]+\\)\\(?::\\([^[:space:]\n]+?\\)\\)?[ \t]*[$#%>]"
+  (concat "^\\[?"                                ; optional `[' (RHEL/Fedora)
+          "\\([[:alnum:]_.-]+\\)"                ; 1: user
+          "@"
+          "\\([[:alnum:]_.-]+\\)"                ; 2: host
+          "\\(?:[: \t]+"                         ; separator: `:' or whitespace
+          "\\([^][:space:]\n]+?\\)\\)?"          ; 3: cwd (optional, no `]')
+          "\\]?"                                 ; optional closing `]'
+          "[ \t]*[$#%>]")                        ; prompt char
   "Regexp used to extract user, host and cwd from the visible shell prompt.
 Capture groups in order: USER (group 1), HOST (group 2), CWD
-(group 3, optional).  The regexp is anchored at column zero, so a
-non-standard PS1 that indents the prompt will not match -- customise
-this if your environment is unusual."
+(group 3, optional).  Anchored at column zero.  Handles both the
+Debian/Ubuntu shape (`user@host:cwd$') and the RHEL/Fedora
+bracketed shape (`[user@host cwd]$').  Customise for prompts that
+don't end with `$', `#', `%' or `>' (e.g. starship/powerline arrows)."
   :type 'regexp :group 'emacs.d)
 
-(defcustom emacs.d/vterm-tramp-sudo-user "root"
-  "User TRAMP must sudo into immediately after the ssh hop to the bastion.
-Mirrors the `RemoteCommand sudo -i' that the interactive ssh_config
-typically runs on a CyberArk-style bastion: the interactive shell is
-already root, but TRAMP's own ssh invocation needs the equivalent
-step expressed as a hop.  Set to nil to disable."
-  :type '(choice (const :tag "No sudo on bastion" nil) string)
+(defcustom emacs.d/vterm-tramp-sudo-user nil
+  "Default user TRAMP sudoes into after the ssh hop to the bastion.
+Set to a string (e.g. \"root\") only if *every* ssh alias you open
+auto-elevates after login; for a mixed environment leave this nil
+and use `emacs.d/ssh-host-tramp-config' to opt in per host."
+  :type '(choice (const :tag "No sudo by default" nil) string)
   :group 'emacs.d)
 
 (defcustom emacs.d/vterm-tramp-bastion-user "root"
-  "User the session is expected to be running as after the bastion sudo.
-Used to decide whether an *extra* `|sudo:USER' hop is needed on
-top of the basic chain: if the prompt's user differs from this
-(typically because of `sudo su - oracle' on the target host) the
-chain grows by one final sudo hop to reach that user."
+  "Default user the session is expected to be running as after the
+bastion sudo.  Compared against the prompt-detected user to decide
+whether an *extra* `|sudo:USER' hop is needed (e.g. after `sudo
+su - oracle' on the target).  Per-host override via
+`emacs.d/ssh-host-tramp-config'."
   :type 'string :group 'emacs.d)
+
+(defcustom emacs.d/ssh-host-tramp-config nil
+  "Per-host TRAMP overrides matched against ssh_config aliases.
+Alist where each car is a regexp matched (with `string-match-p')
+against the alias passed to `emacs.d/ssh-sessions-open', and each
+cdr is a plist with these recognised keys:
+
+  :sudo-user STRING    Become this user via sudo right after the
+                       ssh hop (e.g. \"root\" for a CyberArk-style
+                       bastion that auto-runs `RemoteCommand sudo
+                       -i').  nil disables the sudo hop entirely.
+  :bastion-user STRING The user the session is expected to be
+                       running as after that sudo (default
+                       inherited from `emacs.d/vterm-tramp-bastion-user').
+                       An *extra* sudo is added if the prompt's
+                       user differs (e.g. after `sudo su - oracle').
+
+The first matching entry wins; aliases that match no entry use
+the global defaults.  Example:
+
+  \\='((\"\\\\`\\\\(lx\\\\|kx\\\\)sag\" :sudo-user \"root\")
+    (\"\\\\`my-vps\\\\'\"            :sudo-user nil))"
+  :type '(alist :key-type regexp :value-type plist)
+  :group 'emacs.d)
 
 (defcustom emacs.d/vterm-tramp-auto-sync t
   "When non-nil, continuously sync `default-directory' of session vterms
@@ -105,19 +135,50 @@ back at most 50 lines from `point-max'."
               (match-string-no-properties 2)
               (and (match-beginning 3) (match-string-no-properties 3)))))))
 
+(defun emacs.d/vterm--tramp-host-config (alias)
+  "Return the plist of TRAMP overrides for ALIAS, or nil.
+Walks `emacs.d/ssh-host-tramp-config' and returns the cdr of the
+first entry whose car (a regexp) matches ALIAS."
+  (cdr (cl-find-if (lambda (entry)
+                     (string-match-p (car entry) alias))
+                   emacs.d/ssh-host-tramp-config)))
+
+(defun emacs.d/vterm--tramp-resolved (alias key default)
+  "Look up KEY for ALIAS in `emacs.d/ssh-host-tramp-config'.
+Falls back to DEFAULT when ALIAS matches no entry, or when the
+matched entry does not include KEY."
+  (let ((cfg (emacs.d/vterm--tramp-host-config alias)))
+    (if (plist-member cfg key)
+        (plist-get cfg key)
+      default)))
+
 (defun emacs.d/vterm--tramp-default-directory ()
   "Compose the TRAMP path matching the current session prompt, or nil.
-Builds `/ssh:BASTION[|sudo:U1][|ssh:TARGET][|sudo:U2]:CWD/' from
-the buffer-local state.  Returns nil when bastion, host or cwd are
-still unknown (so callers can skip the sync gracefully)."
+Builds `/ssh:BASTION[|sudo:U1@BASTION][|ssh:TARGET][|sudo:U2@TARGET]:CWD/'
+from the buffer-local state.  Returns nil only when bastion or host
+are still unknown; if cwd has not been captured yet we fall back to
+`~' so the path remains valid and points at the remote home dir.
+
+Per-host sudo behaviour comes from `emacs.d/ssh-host-tramp-config'
+(opt-in alist), with `emacs.d/vterm-tramp-sudo-user' /
+`emacs.d/vterm-tramp-bastion-user' as global defaults.  Each `sudo'
+hop spells out `USER@HOST' explicitly because TRAMP validates that
+a sudo's host matches the host of the previous hop, otherwise
+errors with `host name X does not match Y'."
   (let ((bastion emacs.d/vterm-bastion-name)
         (host    emacs.d/vterm-current-host)
         (user    emacs.d/vterm-current-user)
         (path    emacs.d/vterm-current-path))
-    (when (and bastion host path)
-      (let* ((sudo-on-bastion
-              (and emacs.d/vterm-tramp-sudo-user
-                   (format "|sudo:%s" emacs.d/vterm-tramp-sudo-user)))
+    (when (and bastion host)
+      (let* ((sudo-user-name
+              (emacs.d/vterm--tramp-resolved
+               bastion :sudo-user emacs.d/vterm-tramp-sudo-user))
+             (bastion-user
+              (emacs.d/vterm--tramp-resolved
+               bastion :bastion-user emacs.d/vterm-tramp-bastion-user))
+             (sudo-on-bastion
+              (and sudo-user-name
+                   (format "|sudo:%s@%s" sudo-user-name bastion)))
              (extra-ssh
               (and (not (string-equal host bastion))
                    (format "|ssh:%s" host)))
@@ -128,15 +189,14 @@ still unknown (so callers can skip the sync gracefully)."
               ;; once we have hopped past the bastion.
               (and user
                    extra-ssh
-                   (not (string-equal
-                         user emacs.d/vterm-tramp-bastion-user))
-                   (format "|sudo:%s" user))))
+                   (not (string-equal user bastion-user))
+                   (format "|sudo:%s@%s" user host))))
         (format "/ssh:%s%s%s%s:%s"
                 bastion
                 (or sudo-on-bastion "")
                 (or extra-ssh        "")
                 (or extra-sudo       "")
-                (file-name-as-directory path))))))
+                (file-name-as-directory (or path "~")))))))
 
 (defun emacs.d/tab-bar-rename-tab-by-name (old-name new-name)
   "Rename the tab named OLD-NAME to NEW-NAME on the selected frame.
@@ -201,22 +261,60 @@ in increasing order of volatility.  Hooked as `:after' advice on
                   (unless (string-equal td default-directory)
                     (setq-local default-directory td)))))))))))
 
+(defun emacs.d/vterm--cross-to-remote (command)
+  "Run COMMAND interactively with `default-directory' bound to the
+session's TRAMP path when known.  Falls back to the buffer's
+existing `default-directory' (local on plain vterms, already the
+TRAMP path on session vterms with auto-sync enabled).  Reports in
+the echo area when the fallback kicks in."
+  (let* ((td (emacs.d/vterm--tramp-default-directory))
+         (default-directory (or td default-directory)))
+    (unless td
+      (message "vterm: no remote target -- %s rooted at %s"
+               command default-directory))
+    (call-interactively command)))
+
 ;;;###autoload
 (defun emacs.d/vterm-find-file-remote ()
-  "Open `find-file' with `default-directory' bound to this session's
-TRAMP path.  Use when `emacs.d/vterm-tramp-auto-sync' is nil, or
-to cross to the remote just for this one command from a buffer
-whose `default-directory' is still local."
+  "Open `find-file' rooted at the session's TRAMP path when known."
   (interactive)
-  (let ((td (emacs.d/vterm--tramp-default-directory)))
-    (unless td
-      (user-error
-       "Cannot derive a TRAMP path: missing bastion/host/cwd for this session"))
-    (let ((default-directory td))
-      (call-interactively #'find-file))))
+  (emacs.d/vterm--cross-to-remote #'find-file))
+
+;;;###autoload
+(defun emacs.d/vterm-dired-remote ()
+  "Open `dired' rooted at the session's TRAMP path when known."
+  (interactive)
+  (emacs.d/vterm--cross-to-remote #'dired))
+
+(defun emacs.d/vterm--mode-line-tramp ()
+  "Mode-line segment showing the current SSH chain.
+Returns nil (so the segment is invisible) outside vterm buffers
+or when the buffer's `default-directory' is not a TRAMP path."
+  (when (and (derived-mode-p 'vterm-mode)
+             emacs.d/vterm-bastion-name
+             (file-remote-p default-directory))
+    (let ((bastion emacs.d/vterm-bastion-name)
+          (host    emacs.d/vterm-current-host))
+      (propertize
+       (if (and host (not (string-equal host bastion)))
+           (concat " ⇄" bastion "→" host)
+         (concat " ⇄" bastion))
+       'face 'shadow
+       'help-echo (concat "TRAMP target: " default-directory)))))
 
 (with-eval-after-load 'vterm
-  (advice-add 'vterm--filter :after #'emacs.d/vterm-update-current-host))
+  (advice-add 'vterm--filter :after #'emacs.d/vterm-update-current-host)
+  ;; Bind cross-to-remote commands directly on the keymap rather than
+  ;; via use-package's :bind, which can silently no-op when the module
+  ;; is reloaded after vterm has already been set up.
+  (define-key vterm-mode-map (kbd "C-c f") #'emacs.d/vterm-find-file-remote)
+  (define-key vterm-mode-map (kbd "C-c d") #'emacs.d/vterm-dired-remote)
+  ;; Add the chain indicator to every mode line (the function returns
+  ;; nil outside vterm buffers, so it's invisible elsewhere).  Avoid
+  ;; double-registration on reload.
+  (let ((segment '(:eval (emacs.d/vterm--mode-line-tramp))))
+    (unless (member segment mode-line-misc-info)
+      (setq mode-line-misc-info (append mode-line-misc-info (list segment))))))
 
 (defun emacs.d/vterm-handle-exit (buf _event)
   "Make `q' kill BUF and mark its mode line `[exited]' once vterm dies."

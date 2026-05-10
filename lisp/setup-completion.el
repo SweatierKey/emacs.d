@@ -10,7 +10,12 @@
   :custom
   (vertico-cycle  t)
   (vertico-resize t)
-  (vertico-count  14))
+  (vertico-count  14)
+  :config
+  ;; Candidates grow upward above the input line; the prompt stays
+  ;; pinned at the bottom of the minibuffer, in your line of sight.
+  (require 'vertico-reverse)
+  (vertico-reverse-mode 1))
 
 (use-package marginalia
   :after vertico
