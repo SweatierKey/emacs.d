@@ -108,12 +108,16 @@ ssh again to HOST when it is not the bastion itself, and finally
 sudo to USER when USER is given and differs from the post-elevation
 identity.
 
-The interactive ssh_config Host stanza of BASTION must NOT carry
-`RemoteCommand' or `RequestTTY' settings: this function appends the
-elevation steps via shell, and any RemoteCommand would either
-double-elevate or hijack the chain.  Use `emacs.d/ssh-host-tramp-config'
-to point TRAMP at a separate clean alias if your interactive entry
-must keep those settings for legacy CLI workflows."
+Every ssh hop in the bastion chain carries `-o RemoteCommand=none':
+because this function orchestrates elevation explicitly, any
+`RemoteCommand sudo -i' inherited from the user's ssh_config (a
+CyberArk PSMP convention) would collide with the command we append --
+OpenSSH refuses with `Cannot execute command-line and remote command'.
+The override is inert when no `RemoteCommand' is set, so it is safe to
+apply unconditionally on the bastion path.  The direct (no-bastion)
+branch leaves `RemoteCommand' untouched: that branch issues no extra
+command, so any `RemoteCommand' in the user's config is free to fire
+as part of the host's interactive setup."
   (if (not bastion)
       (cond
        (user (format "ssh -t %s@%s" user host))
@@ -125,11 +129,12 @@ must keep those settings for legacy CLI workflows."
                           bastion :bastion-user
                           (or (bound-and-true-p emacs.d/vterm-tramp-bastion-user)
                               "root")))
-           (parts (list (format "ssh -t %s" bastion))))
+           (ssh-opts "-t -o RemoteCommand=none")
+           (parts (list (format "ssh %s %s" ssh-opts bastion))))
       (when sudo-user
         (setq parts (append parts (list (format "sudo -i -u %s" sudo-user)))))
       (unless (string-equal host bastion)
-        (setq parts (append parts (list (format "ssh -t %s" host)))))
+        (setq parts (append parts (list (format "ssh %s %s" ssh-opts host)))))
       (when (and user
                  (not (string-equal user (or sudo-user bastion-user))))
         (setq parts (append parts (list (format "sudo -i -u %s" user)))))
