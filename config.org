@@ -1731,22 +1731,69 @@ list (a brand-new alias, an IP, a Hostname-like string) connects
 through ~ssh~ all the same.  Any ~Host *~ defaults you have set still
 apply.  This makes "try a new host quickly" a one-keystroke flow.
 
-For per-host options that previously needed an Emacs schema,
-=~/.ssh/config= already covers everything, e.g.:
+Keep your bastion ssh_config entries *clean* -- no ~RemoteCommand~,
+no ~RequestTTY~.  Those settings interfere with TRAMP's prompt
+detection (and also block the multi-step chain this module
+synthesises in shell), so we move all the "auto-elevate after
+login" logic to Emacs.  A typical bastion entry looks like:
 
 #+begin_src conf-space :tangle no
-Host my-bastion
-    HostName  bastion.example.com
-    User      myuser
-    Port      2222
+Host lxsag811 kxsag011 lxsag012
+    HostName     psmpcyb.gbm.lan
+    User         matteo.aquino@CYB-ADMIN1@%n.gbm.lan
     IdentityFile ~/.ssh/id_acme
-    ProxyJump   psmp-gateway
-    # Run a command immediately after authentication.  Combined with
-    # `RequestTTY force', this is the OpenSSH-native way to land you
-    # straight in a privileged shell -- no Lisp post-command needed.
-    RemoteCommand sudo su -
-    RequestTTY    force
+    PreferredAuthentications publickey,keyboard-interactive
+    # no RemoteCommand, no RequestTTY -- both vterm and TRAMP friendly
 #+end_src
+
+** Routing through a bastion (user@host)
+:PROPERTIES:
+:CUSTOM_ID: ssh-sessions-routing
+:END:
+
+The picker accepts two input shapes:
+
+- *bare alias*  -- e.g. =lxsag811=, =zero=, =vps1=.  Direct =ssh -t alias=.
+- *user@host*   -- e.g. =oracle@lxumc811=, =root@lxohr002=.  If the
+  host part matches an entry in ~emacs.d/ssh-target-bastions~ the
+  connection is routed through the configured bastion and the
+  resulting vterm command is the multi-step chain a sysadmin would
+  otherwise type by hand:
+
+  #+begin_example
+  ssh -t BASTION sudo -i -u SUDO-USER ssh -t TARGET sudo -i -u USER
+  #+end_example
+
+  where ~SUDO-USER~ comes from ~emacs.d/ssh-host-tramp-config~
+  (default ~root~), the second =ssh= is skipped when ~TARGET~ equals
+  ~BASTION~, and the trailing ~sudo~ is skipped when ~USER~ already
+  matches the post-elevation identity.  Free input still works for
+  one-off connections to hosts that don't need any of this.
+
+The same ~emacs.d/ssh-host-tramp-config~ that drives the [[#terminal-tramp][TRAMP
+path tracking]] is consulted to find the bastion's elevation
+settings; one source of truth covers both the vterm chain and the
+TRAMP chain.
+
+Example -- two bastions chosen by the host-name *digit group* (the
+first digit after the alpha prefix selects the data-centre / row,
+so `lxumc811' belongs to the 8xx world routed through `lxsag811',
+whereas `lxohr002' is in the 0xx world routed through `lxsag011'):
+
+#+begin_src emacs-lisp :tangle no
+(setq emacs.d/ssh-host-tramp-config
+      '(("\\`\\(lx\\|kx\\)sag" :sudo-user "root")))
+
+(setq emacs.d/ssh-target-bastions
+      '(("\\`lx[a-z]+0[0-9]"     . "lxsag011")
+        ("\\`lx[a-z]+[789][0-9]" . "lxsag811")))
+#+end_src
+
+Then ~C-c s s oracle@lxumc811~ opens a vterm running
+=ssh -t lxsag811 sudo -i -u root ssh -t lxumc811 sudo -i -u oracle=,
+~C-c s s root@lxohr002~ uses =lxsag011= instead, and `C-c f' / `C-c
+d' inside each vterm reach the same file-system view via TRAMP --
+all from one ~setq~ pair.
 
 ** Bindings
 :PROPERTIES:
@@ -1755,7 +1802,7 @@ Host my-bastion
 
 | Key       | Command                     | Purpose                                                           |
 |-----------+-----------------------------+-------------------------------------------------------------------|
-| ~C-c s s~ | ~emacs.d/ssh-sessions-open~ | Pick a host (or type one) and open it in a new tab                |
+| ~C-c s s~ | ~emacs.d/ssh-sessions-open~ | Pick a host or =user@host= and open it in a new tab               |
 | ~C-c s a~ | ~emacs.d/ssh-sessions-add~  | Append a ~Host~ scaffold at the end of =~/.ssh/config=, point ready |
 | ~C-c s e~ | ~emacs.d/ssh-sessions-edit~ | Open =~/.ssh/config= for free-form editing                          |
 
@@ -1771,14 +1818,15 @@ saving to discard the scaffold entirely.
 
 Opening a session:
 
-1. Creates a new tab and renames it to the chosen alias /immediately/,
-   so the label is visible before SSH has even authenticated.
-2. Spawns a vterm whose shell is ~ssh -t <alias>~.  The ~-t~ forces a
-   PTY so any ~RemoteCommand~ in the config runs interactively.
-3. Marks the buffer with ~emacs.d/vterm-bastion-name~ and
-   ~emacs.d/vterm-tab-name~ so [[#terminal-dynamic-title][the title machinery]] can keep the tab
-   in sync with the prompt (e.g. the alias becomes ~alias: realhost~
-   once the shell prompt appears).
+1. Creates a new tab and renames it to the picker input
+   /immediately/, so the label is visible before SSH has even
+   authenticated.
+2. Spawns a vterm whose shell is either ~ssh -t HOST~ or the routed
+   multi-step chain described above.
+3. Pre-seeds ~emacs.d/vterm-bastion-name~ to the resolved bastion
+   alias (or the host itself for direct connections), so the TRAMP
+   default-directory sync can start composing the right chain as
+   soon as the prompt parser yields a host.
 4. Installs the buffer-local ~kill-buffer-hook~ that closes the tab
    when the session is killed (see [[#terminal-closing][Closing sessions]]).
 
@@ -1790,6 +1838,7 @@ Opening a session:
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'subr-x)
 (require 'tab-bar)
 
@@ -1797,6 +1846,29 @@ Opening a session:
   (expand-file-name "~/.ssh/config")
   "OpenSSH client configuration file used as the source of host aliases."
   :type 'file :group 'emacs.d)
+
+(defcustom emacs.d/ssh-target-bastions nil
+  "Alist mapping target-host regexps to the bastion ssh_config alias
+to route through.  Each entry is `(REGEX . BASTION-ALIAS)' where
+REGEX is matched against the host name (the part after `@' in
+`user@host' notation, or the bare host name) given to
+`emacs.d/ssh-sessions-open'.  First match wins.
+
+When you open a session for a target matched here, instead of
+`ssh -t target' the command is built as
+
+    ssh -t BASTION sudo -i -u SUDO-USER ssh -t TARGET [sudo -i -u USER]
+
+mirroring the manual sequence a sysadmin would type by hand.  The
+bastion's per-host settings (sudo-user, tramp-alias) come from
+`emacs.d/ssh-host-tramp-config'.  Targets that match no entry use
+plain `ssh' as before.
+
+Example:
+
+  \\='((\"\\\\`lx\\\\(umc\\\\|ohr\\\\|wfm\\\\)\" . \"lxsag811\"))"
+  :type '(alist :key-type regexp :value-type string)
+  :group 'emacs.d)
 
 (defun emacs.d/ssh-sessions--parse-aliases (file)
   "Return concrete host aliases declared in FILE, omitting wildcards.
@@ -1815,22 +1887,91 @@ must not appear as picker candidates."
               (push token aliases)))))
       (delete-dups (nreverse aliases)))))
 
+(defun emacs.d/ssh-sessions--parse-input (input)
+  "Parse INPUT into (USER . HOST), with USER nil if not given."
+  (if (string-match "\\`\\([^@]+\\)@\\(.+\\)\\'" input)
+      (cons (match-string 1 input) (match-string 2 input))
+    (cons nil input)))
+
+(defun emacs.d/ssh-sessions--bastion-for (host)
+  "Return the bastion alias to route HOST through, or nil if HOST
+doesn't match anything in `emacs.d/ssh-target-bastions'."
+  (cdr (cl-find-if (lambda (entry) (string-match-p (car entry) host))
+                   emacs.d/ssh-target-bastions)))
+
+(defun emacs.d/ssh-sessions--build-command (user host bastion)
+  "Return the shell command to open the session described by USER, HOST
+and BASTION (may be nil for direct connections).
+
+When BASTION is nil: a plain `ssh -t [USER@]HOST'.
+
+When BASTION is set, synthesise the multi-step chain a human would
+type by hand: ssh to the bastion, sudo -i to the bastion's SUDO-USER
+(from `emacs.d/ssh-host-tramp-config'; default `root'), optionally
+ssh again to HOST when it is not the bastion itself, and finally
+sudo to USER when USER is given and differs from the post-elevation
+identity.
+
+The interactive ssh_config Host stanza of BASTION must NOT carry
+`RemoteCommand' or `RequestTTY' settings: this function appends the
+elevation steps via shell, and any RemoteCommand would either
+double-elevate or hijack the chain.  Use `emacs.d/ssh-host-tramp-config'
+to point TRAMP at a separate clean alias if your interactive entry
+must keep those settings for legacy CLI workflows."
+  (if (not bastion)
+      (cond
+       (user (format "ssh -t %s@%s" user host))
+       (t    (format "ssh -t %s" host)))
+    (let* ((sudo-user    (emacs.d/vterm--tramp-resolved
+                          bastion :sudo-user
+                          (bound-and-true-p emacs.d/vterm-tramp-sudo-user)))
+           (bastion-user (emacs.d/vterm--tramp-resolved
+                          bastion :bastion-user
+                          (or (bound-and-true-p emacs.d/vterm-tramp-bastion-user)
+                              "root")))
+           (parts (list (format "ssh -t %s" bastion))))
+      (when sudo-user
+        (setq parts (append parts (list (format "sudo -i -u %s" sudo-user)))))
+      (unless (string-equal host bastion)
+        (setq parts (append parts (list (format "ssh -t %s" host)))))
+      (when (and user
+                 (not (string-equal user (or sudo-user bastion-user))))
+        (setq parts (append parts (list (format "sudo -i -u %s" user)))))
+      (mapconcat #'identity parts " "))))
+
 ;;;###autoload
-(defun emacs.d/ssh-sessions-open (host)
-  "Open an SSH session to HOST in a fresh tab running vterm.
-Candidates come from `emacs.d/ssh-config-file' but any string is
-accepted, so a brand-new alias (or a literal hostname/IP) connects
-straight away through whatever defaults `~/.ssh/config' provides."
+(defun emacs.d/ssh-sessions-open (input)
+  "Open an SSH session in a fresh vterm tab.
+
+INPUT is read from the minibuffer and may take two shapes:
+
+- a bare alias        => direct `ssh -t ALIAS'.  Candidates come
+                         from `emacs.d/ssh-config-file' (free text
+                         accepted too, so a brand-new alias / IP
+                         connects without ceremony).
+
+- `user@host'         => if HOST matches `emacs.d/ssh-target-bastions',
+                         the connection is routed through the bastion
+                         (with auto sudo elevation declared in
+                         `emacs.d/ssh-host-tramp-config') and ends as
+                         USER on HOST.  Otherwise: plain `ssh -t user@host'.
+
+Buffer-local state is primed so the TRAMP `default-directory'
+auto-sync (in setup-terminal) finds the right bastion as soon as
+the prompt parser yields a host."
   (interactive
    (let ((aliases (emacs.d/ssh-sessions--parse-aliases
                    emacs.d/ssh-config-file)))
-     (list (completing-read "SSH host: " aliases nil nil))))
-  (when (string-empty-p host)
+     (list (completing-read "SSH host (or user@host): " aliases nil nil))))
+  (when (string-empty-p input)
     (user-error "No host given"))
-  (let ((cmd      (format "ssh -t %s" host))
-        (buf-name (format "*ssh: %s*" host)))
+  (pcase-let* ((`(,user . ,host) (emacs.d/ssh-sessions--parse-input input))
+               (bastion          (emacs.d/ssh-sessions--bastion-for host))
+               (cmd     (emacs.d/ssh-sessions--build-command user host bastion))
+               (label   input)
+               (buf-name (format "*ssh: %s*" label)))
     (tab-bar-new-tab)
-    (tab-bar-rename-tab host)
+    (tab-bar-rename-tab label)
 
     (require 'vterm)
     (let ((vterm-shell       cmd)
@@ -1838,11 +1979,14 @@ straight away through whatever defaults `~/.ssh/config' provides."
       (vterm vterm-buffer-name))
 
     (with-current-buffer (current-buffer)
+      ;; Pre-seed buffer-local state so TRAMP `default-directory'
+      ;; auto-sync (in setup-terminal) lands on the right hop chain
+      ;; even before the prompt parser has caught the first prompt.
       ;; Stop vterm from renaming the buffer on OSC title escapes:
       ;; setup-terminal already does it from the prompt regex, and
       ;; two competing renamers would race.
-      (setq-local emacs.d/vterm-bastion-name host
-                  emacs.d/vterm-tab-name     host
+      (setq-local emacs.d/vterm-bastion-name (or bastion host)
+                  emacs.d/vterm-tab-name     label
                   vterm-buffer-name-string   nil)
       (add-hook 'kill-buffer-hook
                 #'emacs.d/vterm-close-tab-on-kill nil t))
@@ -1871,9 +2015,7 @@ keep, kill the buffer without saving to discard the scaffold entirely."
             "    User \n"
             "    # Port 22\n"
             "    # IdentityFile ~/.ssh/id_rsa\n"
-            "    # ProxyJump some-bastion\n"
-            "    # RemoteCommand sudo su -\n"
-            "    # RequestTTY force\n")
+            "    # ProxyJump some-bastion\n")
     (goto-char stanza-start)
     (forward-line 1)
     (end-of-line)))
