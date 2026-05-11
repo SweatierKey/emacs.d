@@ -370,21 +370,50 @@ the echo area when the fallback kicks in."
   (interactive)
   (emacs.d/vterm--cross-to-remote #'dired))
 
+(defface emacs.d/vterm-environment-production-face
+  '((t :inherit error :weight bold))
+  "Mode-line face for production-environment session indicator.
+Inherits from `error' so the tag stands out under any theme."
+  :group 'emacs.d)
+
+(defface emacs.d/vterm-environment-other-face
+  '((t :inherit shadow))
+  "Mode-line face for non-production session indicators (preproduction,
+systemtest, integration, ...).  Inherits from `shadow' for a
+subdued look."
+  :group 'emacs.d)
+
 (defun emacs.d/vterm--mode-line-tramp ()
-  "Mode-line segment showing the current SSH chain.
-Returns nil (so the segment is invisible) outside vterm buffers
-or when the buffer's `default-directory' is not a TRAMP path."
+  "Mode-line segment showing the current SSH chain (and environment).
+Format: ` ⇄BASTION[→HOST] [ENV]'.  Returns nil (so the segment is
+invisible) outside vterm buffers or when the buffer's
+`default-directory' is not a TRAMP path.  The environment tag is
+omitted when the host doesn't match anything in
+`emacs.d/ssh-host-environments'; otherwise it is rendered in
+`emacs.d/vterm-environment-production-face' for `production',
+`emacs.d/vterm-environment-other-face' for everything else."
   (when (and (derived-mode-p 'vterm-mode)
              emacs.d/vterm-bastion-name
              (file-remote-p default-directory))
-    (let ((bastion emacs.d/vterm-bastion-name)
-          (host    emacs.d/vterm-current-host))
-      (propertize
-       (if (and host (not (string-equal host bastion)))
-           (concat " ⇄" bastion "→" host)
-         (concat " ⇄" bastion))
-       'face 'shadow
-       'help-echo (concat "TRAMP target: " default-directory)))))
+    (let* ((bastion emacs.d/vterm-bastion-name)
+           (host    emacs.d/vterm-current-host)
+           (env     (and (fboundp 'emacs.d/ssh-env-for-host)
+                         (emacs.d/ssh-env-for-host host)))
+           (chain   (propertize
+                     (if (and host (not (string-equal host bastion)))
+                         (concat " ⇄" bastion "→" host)
+                       (concat " ⇄" bastion))
+                     'face 'shadow))
+           (env-tag (when env
+                      (propertize
+                       (format " [%s]" (upcase env))
+                       'face (if (string-equal env "production")
+                                  'emacs.d/vterm-environment-production-face
+                                'emacs.d/vterm-environment-other-face)))))
+      (propertize (concat chain (or env-tag ""))
+                  'help-echo (concat "TRAMP target: " default-directory
+                                     (when env
+                                       (format "\nEnvironment: %s" env)))))))
 
 (with-eval-after-load 'vterm
   (advice-add 'vterm--filter :after #'emacs.d/vterm-update-current-host)

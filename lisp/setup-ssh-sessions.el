@@ -14,6 +14,31 @@
   "OpenSSH client configuration file used as the source of host aliases."
   :type 'file :group 'emacs.d)
 
+(defcustom emacs.d/ssh-host-environments
+  '(("\\`lx[a-z]+0[0-9]" . "production")
+    ("\\`lx[a-z]+7[0-9]" . "integration")
+    ("\\`lx[a-z]+8[0-9]" . "systemtest")
+    ("\\`lx[a-z]+9[0-9]" . "preproduction"))
+  "Alist mapping host-name regexps to the environment they belong to.
+First match wins.  Consumed by `emacs.d/vterm--mode-line-tramp'
+to annotate the SSH chain indicator with a tag like `[PROD]' /
+`[INTEG]' / `[SYSTEMTEST]' / `[PREPROD]', rendered with a face
+that highlights production sessions (red) versus the other
+non-prod environments (subdued).  Empty list = no annotations.
+
+Default reflects this user's host-digit convention: the first
+digit of the numeric group after the alphabetic prefix encodes
+the environment (0 = prod, 7 = integ, 8 = systemtest, 9 = preprod)."
+  :type '(alist :key-type regexp :value-type string)
+  :group 'emacs.d)
+
+(defun emacs.d/ssh-env-for-host (host)
+  "Return the environment name for HOST, or nil if no entry matches.
+Looks HOST up in `emacs.d/ssh-host-environments'."
+  (when host
+    (cdr (cl-find-if (lambda (entry) (string-match-p (car entry) host))
+                     emacs.d/ssh-host-environments))))
+
 (defcustom emacs.d/ssh-target-bastions
   '(("\\`lx[a-z]+0[0-9]"     . "lxsag011")
     ("\\`lx[a-z]+[789][0-9]" . "lxsag811"))
