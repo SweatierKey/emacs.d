@@ -89,6 +89,28 @@ must not appear as picker candidates."
       (cons (match-string 1 input) (match-string 2 input))
     (cons nil input)))
 
+(defconst emacs.d/ssh-sessions--ssh-supports-remotecommand-opt
+  (and (executable-find "ssh")
+       (let ((out (with-temp-buffer
+                    ;; `ssh -V' writes to stderr on most builds; capture both.
+                    (ignore-errors
+                      (call-process "ssh" nil '(t t) nil "-V"))
+                    (buffer-string))))
+         (when (string-match "OpenSSH_\\([0-9]+\\)\\.\\([0-9]+\\)" out)
+           (let ((major (string-to-number (match-string 1 out)))
+                 (minor (string-to-number (match-string 2 out))))
+             ;; `RemoteCommand' arrived in OpenSSH 7.6 (October 2017).
+             ;; Older clients refuse `-o RemoteCommand=...' as a
+             ;; `Bad configuration option' and abort the connection.
+             (or (> major 7) (and (= major 7) (>= minor 6)))))))
+  "Non-nil when the local `ssh' understands `-o RemoteCommand=...'.
+Determined once when this file is loaded by parsing `ssh -V'.
+Consumed by `emacs.d/ssh-sessions--build-command' to decide whether
+it is safe to neutralise an inherited `RemoteCommand sudo -i' on the
+bastion path.  On older clients we omit the option and rely on the
+ssh_config Host stanza of the bastion being free of `RemoteCommand'
+(see the section comment in config.org).")
+
 (defun emacs.d/ssh-sessions--bastion-for (host)
   "Return the bastion alias to route HOST through, or nil if HOST
 doesn't match anything in `emacs.d/ssh-target-bastions'."
@@ -108,16 +130,25 @@ ssh again to HOST when it is not the bastion itself, and finally
 sudo to USER when USER is given and differs from the post-elevation
 identity.
 
-Every ssh hop in the bastion chain carries `-o RemoteCommand=none':
-because this function orchestrates elevation explicitly, any
+When the local OpenSSH is recent enough (7.6+, see
+`emacs.d/ssh-sessions--ssh-supports-remotecommand-opt'), every ssh
+hop in the bastion chain carries `-o RemoteCommand=none': this
+function orchestrates elevation explicitly, so any
 `RemoteCommand sudo -i' inherited from the user's ssh_config (a
 CyberArk PSMP convention) would collide with the command we append --
 OpenSSH refuses with `Cannot execute command-line and remote command'.
 The override is inert when no `RemoteCommand' is set, so it is safe to
-apply unconditionally on the bastion path.  The direct (no-bastion)
-branch leaves `RemoteCommand' untouched: that branch issues no extra
-command, so any `RemoteCommand' in the user's config is free to fire
-as part of the host's interactive setup."
+apply on every bastion hop.
+
+On older OpenSSH clients (< 7.6) the `-o RemoteCommand' option is
+unknown and ssh refuses to start at all (`Bad configuration option:
+remotecommand') -- so we omit it and rely on the user keeping the
+bastion's ssh_config Host stanza free of `RemoteCommand'.
+
+The direct (no-bastion) branch leaves `RemoteCommand' untouched in
+either case: that branch issues no extra command, so any
+`RemoteCommand' in the user's config is free to fire as part of the
+host's interactive setup."
   (if (not bastion)
       (cond
        (user (format "ssh -t %s@%s" user host))
@@ -129,7 +160,9 @@ as part of the host's interactive setup."
                           bastion :bastion-user
                           (or (bound-and-true-p emacs.d/vterm-tramp-bastion-user)
                               "root")))
-           (ssh-opts "-t -o RemoteCommand=none")
+           (ssh-opts (if emacs.d/ssh-sessions--ssh-supports-remotecommand-opt
+                         "-t -o RemoteCommand=none"
+                       "-t"))
            (parts (list (format "ssh %s %s" ssh-opts bastion))))
       (when sudo-user
         (setq parts (append parts (list (format "sudo -i -u %s" sudo-user)))))
