@@ -54,27 +54,6 @@ been drawn.")
   "Last tab title applied for this vterm buffer.
 Used to find the right tab to rename when the prompt host changes.")
 
-(defvar-local emacs.d/vterm-pending-chain nil
-  "List of shell lines the auto-stepper has yet to type into this buffer.
-Seeded by `emacs.d/ssh-sessions-open' for bastion-routed sessions
-and consumed by `emacs.d/vterm--advance-pending-chain' one entry
-per prompt transition.  Each entry is a single shell line (without
-trailing newline); the stepper appends Return when sending it.
-
-Why we type the chain interactively instead of appending it to the
-ssh CLI: CyberArk PSMP-fronted bastions reject any extra command
-argument on the ssh line with `Invalid session state'.  By driving
-the chain *inside* the bastion shell we mimic exactly what a
-sysadmin would type by hand -- the one approach PSMP accepts.")
-
-(defvar-local emacs.d/vterm--pending-chain-last-sig nil
-  "Last (USER . HOST) signature the auto-stepper has already responded to.
-The prompt parser fires after every libvterm screen update, so a
-single chain step typically observes many intermediate parser hits
-between sending its command and the shell drawing the new prompt.
-Comparing against this signature ensures we send each step exactly
-once per *real* prompt transition.")
-
 (defcustom emacs.d/vterm-prompt-host-regexp
   (concat "^\\[?"                                ; optional `[' (RHEL/Fedora)
           "\\([[:alnum:]_.-]+\\)"                ; 1: user
@@ -323,44 +302,6 @@ Format: `*ssh: TAB-NAME[ — PATH]*'."
       (format "*ssh: %s — %s*" tab-name path)
     (format "*ssh: %s*" tab-name)))
 
-(defun emacs.d/vterm--advance-pending-chain ()
-  "Type the next pending chain step into this vterm, if any.
-Pops one entry from `emacs.d/vterm-pending-chain' the *first* time
-the prompt signature (USER . HOST) is observed in its new value,
-sends it followed by Return, and records the signature in
-`emacs.d/vterm--pending-chain-last-sig' so further prompt-parser
-firings on the same prompt are ignored.  No-op when the chain is
-empty, when user/host are still unknown, or when the signature is
-identical to the last responded one (e.g. command echo before the
-shell has rendered the new prompt).
-
-Before sending, leading `sudo -i -u USER' entries whose target USER
-already matches `emacs.d/vterm-current-user' are dropped from the
-queue: this is what makes the stepper compatible with bastions whose
-ssh_config carries `RemoteCommand sudo -i' (the elevated session
-arrives *already* as the sudo target, so our explicit sudo step
-would be a no-op).  Inner `ssh -t' steps are never skipped --
-they're always needed when present."
-  (when (and emacs.d/vterm-pending-chain
-             emacs.d/vterm-current-host
-             emacs.d/vterm-current-user)
-    (let ((sig (cons emacs.d/vterm-current-user
-                     emacs.d/vterm-current-host)))
-      (unless (equal sig emacs.d/vterm--pending-chain-last-sig)
-        (setq-local emacs.d/vterm--pending-chain-last-sig sig)
-        (while (and emacs.d/vterm-pending-chain
-                    (let ((s (car emacs.d/vterm-pending-chain)))
-                      (and (string-match
-                            "\\`sudo -i -u \\(.+\\)\\'" s)
-                           (string-equal
-                            (match-string 1 s)
-                            emacs.d/vterm-current-user))))
-          (pop emacs.d/vterm-pending-chain))
-        (when emacs.d/vterm-pending-chain
-          (let ((next (pop emacs.d/vterm-pending-chain)))
-            (vterm-send-string next)
-            (vterm-send-return)))))))
-
 (defun emacs.d/vterm-update-current-host (&rest _ignored)
   "Refresh user/host/path from the prompt and rename tab + buffer, then
 optionally sync `default-directory' to the matching TRAMP path.
@@ -368,9 +309,7 @@ The tab name only tracks the *host* (stable identity of the SSH
 session), the buffer name additionally reflects the *cwd*, and the
 TRAMP-derived `default-directory' also tracks the current *user* --
 in increasing order of volatility.  Hooked as `:after' advice on
-`vterm--filter'.  After updating the state, advances the
-pending-chain auto-stepper so PSMP-style sessions can type their
-sudo/ssh hops one at a time."
+`vterm--filter'."
   (when (derived-mode-p 'vterm-mode)
     (let* ((ctx      (emacs.d/vterm-extract-prompt-context))
            (new-user (nth 0 ctx))
@@ -383,8 +322,6 @@ sudo/ssh hops one at a time."
           (when host-changed (setq-local emacs.d/vterm-current-host new-host))
           (when user-changed (setq-local emacs.d/vterm-current-user new-user))
           (when path-changed (setq-local emacs.d/vterm-current-path new-path))
-          (when (or host-changed user-changed)
-            (emacs.d/vterm--advance-pending-chain))
           (when (and emacs.d/vterm-tab-name
                      (or host-changed user-changed path-changed))
             (let* ((bastion      emacs.d/vterm-bastion-name)

@@ -1307,27 +1307,6 @@ been drawn.")
   "Last tab title applied for this vterm buffer.
 Used to find the right tab to rename when the prompt host changes.")
 
-(defvar-local emacs.d/vterm-pending-chain nil
-  "List of shell lines the auto-stepper has yet to type into this buffer.
-Seeded by `emacs.d/ssh-sessions-open' for bastion-routed sessions
-and consumed by `emacs.d/vterm--advance-pending-chain' one entry
-per prompt transition.  Each entry is a single shell line (without
-trailing newline); the stepper appends Return when sending it.
-
-Why we type the chain interactively instead of appending it to the
-ssh CLI: CyberArk PSMP-fronted bastions reject any extra command
-argument on the ssh line with `Invalid session state'.  By driving
-the chain *inside* the bastion shell we mimic exactly what a
-sysadmin would type by hand -- the one approach PSMP accepts.")
-
-(defvar-local emacs.d/vterm--pending-chain-last-sig nil
-  "Last (USER . HOST) signature the auto-stepper has already responded to.
-The prompt parser fires after every libvterm screen update, so a
-single chain step typically observes many intermediate parser hits
-between sending its command and the shell drawing the new prompt.
-Comparing against this signature ensures we send each step exactly
-once per *real* prompt transition.")
-
 (defcustom emacs.d/vterm-prompt-host-regexp
   (concat "^\\[?"                                ; optional `[' (RHEL/Fedora)
           "\\([[:alnum:]_.-]+\\)"                ; 1: user
@@ -1576,44 +1555,6 @@ Format: `*ssh: TAB-NAME[ — PATH]*'."
       (format "*ssh: %s — %s*" tab-name path)
     (format "*ssh: %s*" tab-name)))
 
-(defun emacs.d/vterm--advance-pending-chain ()
-  "Type the next pending chain step into this vterm, if any.
-Pops one entry from `emacs.d/vterm-pending-chain' the *first* time
-the prompt signature (USER . HOST) is observed in its new value,
-sends it followed by Return, and records the signature in
-`emacs.d/vterm--pending-chain-last-sig' so further prompt-parser
-firings on the same prompt are ignored.  No-op when the chain is
-empty, when user/host are still unknown, or when the signature is
-identical to the last responded one (e.g. command echo before the
-shell has rendered the new prompt).
-
-Before sending, leading `sudo -i -u USER' entries whose target USER
-already matches `emacs.d/vterm-current-user' are dropped from the
-queue: this is what makes the stepper compatible with bastions whose
-ssh_config carries `RemoteCommand sudo -i' (the elevated session
-arrives *already* as the sudo target, so our explicit sudo step
-would be a no-op).  Inner `ssh -t' steps are never skipped --
-they're always needed when present."
-  (when (and emacs.d/vterm-pending-chain
-             emacs.d/vterm-current-host
-             emacs.d/vterm-current-user)
-    (let ((sig (cons emacs.d/vterm-current-user
-                     emacs.d/vterm-current-host)))
-      (unless (equal sig emacs.d/vterm--pending-chain-last-sig)
-        (setq-local emacs.d/vterm--pending-chain-last-sig sig)
-        (while (and emacs.d/vterm-pending-chain
-                    (let ((s (car emacs.d/vterm-pending-chain)))
-                      (and (string-match
-                            "\\`sudo -i -u \\(.+\\)\\'" s)
-                           (string-equal
-                            (match-string 1 s)
-                            emacs.d/vterm-current-user))))
-          (pop emacs.d/vterm-pending-chain))
-        (when emacs.d/vterm-pending-chain
-          (let ((next (pop emacs.d/vterm-pending-chain)))
-            (vterm-send-string next)
-            (vterm-send-return)))))))
-
 (defun emacs.d/vterm-update-current-host (&rest _ignored)
   "Refresh user/host/path from the prompt and rename tab + buffer, then
 optionally sync `default-directory' to the matching TRAMP path.
@@ -1621,9 +1562,7 @@ The tab name only tracks the *host* (stable identity of the SSH
 session), the buffer name additionally reflects the *cwd*, and the
 TRAMP-derived `default-directory' also tracks the current *user* --
 in increasing order of volatility.  Hooked as `:after' advice on
-`vterm--filter'.  After updating the state, advances the
-pending-chain auto-stepper so PSMP-style sessions can type their
-sudo/ssh hops one at a time."
+`vterm--filter'."
   (when (derived-mode-p 'vterm-mode)
     (let* ((ctx      (emacs.d/vterm-extract-prompt-context))
            (new-user (nth 0 ctx))
@@ -1636,8 +1575,6 @@ sudo/ssh hops one at a time."
           (when host-changed (setq-local emacs.d/vterm-current-host new-host))
           (when user-changed (setq-local emacs.d/vterm-current-user new-user))
           (when path-changed (setq-local emacs.d/vterm-current-path new-path))
-          (when (or host-changed user-changed)
-            (emacs.d/vterm--advance-pending-chain))
           (when (and emacs.d/vterm-tab-name
                      (or host-changed user-changed path-changed))
             (let* ((bastion      emacs.d/vterm-bastion-name)
@@ -1861,45 +1798,34 @@ list (a brand-new alias, an IP, a Hostname-like string) connects
 through ~ssh~ all the same.  Any ~Host *~ defaults you have set still
 apply.  This makes "try a new host quickly" a one-keystroke flow.
 
-For *speed* on PSMP-fronted bastions we recommend keeping
-~RemoteCommand sudo -i~ in the bastion's ssh_config stanza: the
-elevation then happens during the SSH handshake instead of costing
-an extra interactive round-trip after login.  The auto-stepper
-(see `emacs.d/vterm--advance-pending-chain') is idempotent: it
-notices when the queued `sudo -i -u root' step is already
-satisfied by the arriving session (because RemoteCommand has
-elevated us) and silently drops it, so the two layers compose
-cleanly.
-
-The cost: ~RemoteCommand~ confuses TRAMP's prompt detection on the
-*same* alias.  We therefore declare two Host stanzas per bastion --
-an *interactive* alias that carries the RemoteCommand for vterm
-sessions, and a *clean* TRAMP-only alias pointing at the same
-HostName -- and point TRAMP at the latter via the ~:tramp-alias~
-key of `emacs.d/ssh-host-tramp-config'.  Example:
+Keep your bastion ssh_config entries *clean* -- no ~RemoteCommand~,
+no ~RequestTTY~.  Those settings interfere with TRAMP's prompt
+detection (and also collide with the multi-step chain this module
+appends to the ssh CLI -- OpenSSH refuses with ~Cannot execute
+command-line and remote command~), so we move all the "auto-elevate
+after login" logic to Emacs.  A typical bastion entry looks like:
 
 #+begin_src conf-space :tangle no
-# Interactive: fast PSMP-friendly auto-elevation via RemoteCommand
 Host lxsag811 lxsag011 lxsag012
     HostName     psmpcyb.gbm.lan
     User         matteo.aquino@CYB-ADMIN1@%n.gbm.lan
     IdentityFile ~/.ssh/id_acme
     PreferredAuthentications publickey,keyboard-interactive
-    RemoteCommand sudo -i
-    RequestTTY    yes
-
-# TRAMP-only: no RemoteCommand, no RequestTTY -- clean for TRAMP
-Host lxsag811-tramp lxsag011-tramp lxsag012-tramp
-    HostName     psmpcyb.gbm.lan
-    User         matteo.aquino@CYB-ADMIN1@%n.gbm.lan
-    IdentityFile ~/.ssh/id_acme
-    PreferredAuthentications publickey,keyboard-interactive
+    # no RemoteCommand, no RequestTTY -- both vterm and TRAMP friendly
 #+end_src
 
-If you cannot keep ~RemoteCommand~ in your ssh_config (e.g. corporate
-policy forbids it, or you prefer a single Host stanza), simply omit
-it: the stepper falls back to typing ~sudo -i -u root~ interactively
-on the first bastion prompt -- correct, just one round-trip slower.
+The shell command the module synthesises is one line -- e.g. for
+~C-c s s oracle@lxumc811~:
+
+#+begin_src text :tangle no
+ssh -t lxsag811 sudo -i -u root ssh -t lxumc811 sudo -i -u oracle
+#+end_src
+
+PSMP receives the whole pipeline as a single SSH exec request and
+hands the inner shell commands through to the bastion, where they
+execute in sequence.  Elevation is faster than a typed-by-hand
+flow because there is no round-trip waiting for each prompt to
+appear.
 
 ** Routing through a bastion (user@host)
 :PROPERTIES:
@@ -2088,44 +2014,32 @@ doesn't match anything in `emacs.d/ssh-target-bastions'."
   (cdr (cl-find-if (lambda (entry) (string-match-p (car entry) host))
                    emacs.d/ssh-target-bastions)))
 
-(defun emacs.d/ssh-sessions--build-chain (user host bastion)
-  "Return (INITIAL-CMD . POST-LOGIN-STEPS) for the session described by
-USER, HOST and BASTION (nil for direct connections).
+(defun emacs.d/ssh-sessions--build-command (user host bastion)
+  "Return the shell command to open the session described by USER, HOST
+and BASTION (may be nil for direct connections).
 
-INITIAL-CMD is the shell command passed to `vterm-shell' -- a plain
-`ssh -t ...' with NO extra command appended.  POST-LOGIN-STEPS is a
-list of shell lines that the auto-stepper in setup-terminal will
-type interactively, one per detected prompt transition, to complete
-the chain (sudo elevations and inner ssh hops).
+When BASTION is nil: a plain `ssh -t [USER@]HOST'.
 
-Why interactive instead of a single shell command on the ssh CLI?
-CyberArk PSMP-fronted bastions reject extra command arguments with
-\"Invalid session state\" -- the proxy intercepts the SSH session
-and only allows commands that flow through its normal session
-recording path.  Typing the chain *inside* the bastion shell, as a
-human would, is the only PSMP-compatible way to drive a multi-hop
-session from Emacs.  This approach is also strictly more general:
-on non-PSMP environments the same logic happens to work, just with
-one more network round-trip than the all-CLI form would have used.
+When BASTION is set, synthesise the multi-step chain a human would
+type by hand: ssh to the bastion, sudo -i to the bastion's SUDO-USER
+(from `emacs.d/ssh-host-tramp-config'; default `root'), optionally
+ssh again to HOST when it is not the bastion itself, and finally
+sudo to USER when USER is given and differs from the post-elevation
+identity.  All steps go on the ssh CLI in a single command -- the
+remote shell parses them sequentially, exactly as you would type
+them by hand.
 
-Chain shape:
-- BASTION nil           => (\"ssh -t [USER@]HOST\" . nil)
-- BASTION set, host==bastion, no sudo-user
-                        => (\"ssh -t BASTION\" . nil)
-- BASTION set, on bastion w/ sudo-user
-                        => (\"ssh -t BASTION\" . (\"sudo -i -u SUDO\"))
-- BASTION set, target through bastion
-                        => (\"ssh -t BASTION\"
-                            . (\"sudo -i -u SUDO\"
-                               \"ssh -t HOST\"
-                               [\"sudo -i -u USER\"]))
-                          (the last sudo only when USER differs from
-                          SUDO-USER and BASTION-USER)"
+The interactive ssh_config Host stanza of BASTION must NOT carry
+`RemoteCommand' or `RequestTTY' settings: this function appends the
+elevation steps via shell, and any inherited `RemoteCommand' would
+collide with our CLI command (OpenSSH refuses with `Cannot execute
+command-line and remote command').  Use `emacs.d/ssh-host-tramp-config'
+to point TRAMP at a separate clean alias if your interactive entry
+must keep those settings for legacy CLI workflows."
   (if (not bastion)
-      (cons (cond
-             (user (format "ssh -t %s@%s" user host))
-             (t    (format "ssh -t %s" host)))
-            nil)
+      (cond
+       (user (format "ssh -t %s@%s" user host))
+       (t    (format "ssh -t %s" host)))
     (let* ((sudo-user    (emacs.d/vterm--tramp-resolved
                           bastion :sudo-user
                           (bound-and-true-p emacs.d/vterm-tramp-sudo-user)))
@@ -2133,16 +2047,15 @@ Chain shape:
                           bastion :bastion-user
                           (or (bound-and-true-p emacs.d/vterm-tramp-bastion-user)
                               "root")))
-           (initial (format "ssh -t %s" bastion))
-           (steps   nil))
+           (parts (list (format "ssh -t %s" bastion))))
       (when sudo-user
-        (push (format "sudo -i -u %s" sudo-user) steps))
+        (setq parts (append parts (list (format "sudo -i -u %s" sudo-user)))))
       (unless (string-equal host bastion)
-        (push (format "ssh -t %s" host) steps))
+        (setq parts (append parts (list (format "ssh -t %s" host)))))
       (when (and user
                  (not (string-equal user (or sudo-user bastion-user))))
-        (push (format "sudo -i -u %s" user) steps))
-      (cons initial (nreverse steps)))))
+        (setq parts (append parts (list (format "sudo -i -u %s" user)))))
+      (mapconcat #'identity parts " "))))
 
 ;;;###autoload
 (defun emacs.d/ssh-sessions-open (input)
@@ -2172,16 +2085,14 @@ the prompt parser yields a host."
     (user-error "No host given"))
   (pcase-let* ((`(,user . ,host) (emacs.d/ssh-sessions--parse-input input))
                (bastion          (emacs.d/ssh-sessions--bastion-for host))
-               (`(,initial . ,steps)
-                                 (emacs.d/ssh-sessions--build-chain
-                                  user host bastion))
-               (label    input)
+               (cmd     (emacs.d/ssh-sessions--build-command user host bastion))
+               (label   input)
                (buf-name (format "*ssh: %s*" label)))
     (tab-bar-new-tab)
     (tab-bar-rename-tab label)
 
     (require 'vterm)
-    (let ((vterm-shell       initial)
+    (let ((vterm-shell       cmd)
           (vterm-buffer-name buf-name))
       (vterm vterm-buffer-name))
 
@@ -2191,14 +2102,10 @@ the prompt parser yields a host."
       ;; even before the prompt parser has caught the first prompt.
       ;; Stop vterm from renaming the buffer on OSC title escapes:
       ;; setup-terminal already does it from the prompt regex, and
-      ;; two competing renamers would race.  Also publish the
-      ;; pending-chain steps so the auto-stepper in setup-terminal
-      ;; types each one in as soon as the corresponding prompt is
-      ;; detected (PSMP-compatible, see `--build-chain' docstring).
-      (setq-local emacs.d/vterm-bastion-name  (or bastion host)
-                  emacs.d/vterm-tab-name      label
-                  emacs.d/vterm-pending-chain steps
-                  vterm-buffer-name-string    nil)
+      ;; two competing renamers would race.
+      (setq-local emacs.d/vterm-bastion-name (or bastion host)
+                  emacs.d/vterm-tab-name     label
+                  vterm-buffer-name-string   nil)
       (add-hook 'kill-buffer-hook
                 #'emacs.d/vterm-close-tab-on-kill nil t))
 
