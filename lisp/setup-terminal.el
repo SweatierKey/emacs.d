@@ -179,55 +179,110 @@ back to BASTION itself."
      ((functionp override) (funcall override bastion))
      (t                    bastion))))
 
-(defun emacs.d/vterm--tramp-default-directory ()
-  "Compose the TRAMP path matching the current session prompt, or nil.
-Builds `/ssh:BASTION[|sudo:U1@BASTION][|ssh:TARGET][|sudo:U2@TARGET]:CWD/'
-from the buffer-local state.  Returns nil only when bastion or host
-are still unknown; if cwd has not been captured yet we fall back to
-`~' so the path remains valid and points at the remote home dir.
+(defun emacs.d/vterm--tramp-anchor (str-or-empty)
+  "Wrap STR-OR-EMPTY in `\\`...\\''-anchored regexp form.
+Returns `\\`\\''  (the empty-string-only matcher) when STR-OR-EMPTY
+is nil or empty -- TRAMP treats this as `user not specified',
+preventing the proxy entry from matching arbitrary users."
+  (if (or (null str-or-empty) (string-empty-p str-or-empty))
+      "\\`\\'"
+    (concat "\\`" (regexp-quote str-or-empty) "\\'")))
 
-Per-host overrides come from `emacs.d/ssh-host-tramp-config' (opt-in
-alist): `:sudo-user' selects the sudo step, `:tramp-alias' picks a
-different ssh_config Host stanza for TRAMP than for the interactive
-session.  Globals `emacs.d/vterm-tramp-sudo-user' /
-`emacs.d/vterm-tramp-bastion-user' apply when an alias matches no
-entry.  Each `sudo' hop spells out `USER@HOST' explicitly because
-TRAMP validates that a sudo's host matches the host of the previous
-hop, otherwise errors with `host name X does not match Y'."
+(defun emacs.d/vterm--tramp-chain (bastion tramp-alias host user path
+                                           sudo-user bastion-user)
+  "Return `(DEEPEST-PATH . PROXY-ENTRIES)' describing the TRAMP setup
+matching the prompt-derived session state.  DEEPEST-PATH is the
+minimal-form TRAMP path (single or two-method) that
+`default-directory' should hold; PROXY-ENTRIES is a list of
+`(HOST-RX USER-RX PROXY-STRING)' triples to add to
+`tramp-default-proxies-alist' so TRAMP can resolve DEEPEST-PATH
+into the full multi-hop chain.
+
+The shape of the chain is chosen from five cases:
+
+  A. plain ssh, on bastion             /ssh:TRAMP-ALIAS:CWD
+  B. plain ssh, hopped to a target     /ssh:HOST:CWD
+  C. with sudo, on bastion             /sudo:SUDO-USER@TRAMP-ALIAS:CWD
+  D. with sudo, on target as SUDO-USER /ssh:HOST:CWD
+  E. with sudo, on target as USER      /sudo:USER@HOST:CWD
+
+This split exists because TRAMP's ad-hoc chain parsing
+(`tramp-add-hops') generates proxy entries with a nil user-regexp
+that matches *any* user and beats the legitimate intermediate
+entries -- producing the `Host name X does not match Y' error
+when the chain has more than 3 hops.  By building the proxy list
+ourselves with anchored user regexes the ordering bug is avoided."
+  (let* ((on-bastion (string-equal host bastion))
+         (path/      (file-name-as-directory (or path "~")))
+         deepest entries)
+    (cond
+     ((and (not sudo-user) on-bastion)                     ; A
+      (setq deepest (format "/ssh:%s:%s" tramp-alias path/)))
+     ((not sudo-user)                                       ; B
+      (setq deepest (format "/ssh:%s:%s" host path/))
+      (push (list (emacs.d/vterm--tramp-anchor host)
+                  "\\`\\'"
+                  (format "/ssh:%s:" tramp-alias))
+            entries))
+     (on-bastion                                            ; C
+      (setq deepest (format "/sudo:%s@%s:%s"
+                            sudo-user tramp-alias path/))
+      (push (list (emacs.d/vterm--tramp-anchor tramp-alias)
+                  (emacs.d/vterm--tramp-anchor sudo-user)
+                  (format "/ssh:%s:" tramp-alias))
+            entries))
+     ((string-equal user bastion-user)                      ; D
+      (setq deepest (format "/ssh:%s:%s" host path/))
+      (push (list (emacs.d/vterm--tramp-anchor host)
+                  "\\`\\'"
+                  (format "/sudo:%s@%s:" sudo-user tramp-alias))
+            entries)
+      (push (list (emacs.d/vterm--tramp-anchor tramp-alias)
+                  (emacs.d/vterm--tramp-anchor sudo-user)
+                  (format "/ssh:%s:" tramp-alias))
+            entries))
+     (t                                                     ; E
+      (setq deepest (format "/sudo:%s@%s:%s" user host path/))
+      (push (list (emacs.d/vterm--tramp-anchor host)
+                  (emacs.d/vterm--tramp-anchor user)
+                  (format "/ssh:%s:" host))
+            entries)
+      (push (list (emacs.d/vterm--tramp-anchor host)
+                  "\\`\\'"
+                  (format "/sudo:%s@%s:" sudo-user tramp-alias))
+            entries)
+      (push (list (emacs.d/vterm--tramp-anchor tramp-alias)
+                  (emacs.d/vterm--tramp-anchor sudo-user)
+                  (format "/ssh:%s:" tramp-alias))
+            entries)))
+    (cons deepest entries)))
+
+(defun emacs.d/vterm--tramp-default-directory ()
+  "Side-effecting wrapper around `emacs.d/vterm--tramp-chain'.
+Returns the deepest TRAMP path matching the current session
+prompt, and installs the proxy entries it needs in
+`tramp-default-proxies-alist' (idempotently, no removal on
+session close -- entries are tiny and mutually exclusive).
+Returns nil when bastion or host are still unknown."
   (let ((bastion emacs.d/vterm-bastion-name)
         (host    emacs.d/vterm-current-host)
         (user    emacs.d/vterm-current-user)
         (path    emacs.d/vterm-current-path))
     (when (and bastion host)
-      (let* ((tramp-alias
-              (emacs.d/vterm--tramp-resolve-alias bastion))
-             (sudo-user-name
-              (emacs.d/vterm--tramp-resolved
-               bastion :sudo-user emacs.d/vterm-tramp-sudo-user))
-             (bastion-user
-              (emacs.d/vterm--tramp-resolved
-               bastion :bastion-user emacs.d/vterm-tramp-bastion-user))
-             (sudo-on-bastion
-              (and sudo-user-name
-                   (format "|sudo:%s@%s" sudo-user-name tramp-alias)))
-             (extra-ssh
-              (and (not (string-equal host bastion))
-                   (format "|ssh:%s" host)))
-             (extra-sudo
-              ;; Add another sudo only when the prompt's user is not
-              ;; the post-bastion default -- typically because of a
-              ;; `sudo su - oracle' on the target.  Only meaningful
-              ;; once we have hopped past the bastion.
-              (and user
-                   extra-ssh
-                   (not (string-equal user bastion-user))
-                   (format "|sudo:%s@%s" user host))))
-        (format "/ssh:%s%s%s%s:%s"
-                tramp-alias
-                (or sudo-on-bastion "")
-                (or extra-ssh        "")
-                (or extra-sudo       "")
-                (file-name-as-directory (or path "~")))))))
+      (require 'tramp)
+      (let* ((tramp-alias    (emacs.d/vterm--tramp-resolve-alias bastion))
+             (sudo-user-name (emacs.d/vterm--tramp-resolved
+                              bastion :sudo-user
+                              emacs.d/vterm-tramp-sudo-user))
+             (bastion-user   (emacs.d/vterm--tramp-resolved
+                              bastion :bastion-user
+                              emacs.d/vterm-tramp-bastion-user))
+             (chain (emacs.d/vterm--tramp-chain
+                     bastion tramp-alias host user path
+                     sudo-user-name bastion-user)))
+        (dolist (e (cdr chain))
+          (add-to-list 'tramp-default-proxies-alist e))
+        (car chain)))))
 
 (defun emacs.d/tab-bar-rename-tab-by-name (old-name new-name)
   "Rename the tab named OLD-NAME to NEW-NAME on the selected frame.
