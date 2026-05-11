@@ -1668,6 +1668,36 @@ omitted when the host doesn't match anything in
                                      (when env
                                        (format "\nEnvironment: %s" env)))))))
 
+(defvar emacs.d/vterm--pixel-scroll-passthrough-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m [next]  #'vterm--self-insert)
+    (define-key m [prior] #'vterm--self-insert)
+    m)
+  "Override map that re-routes `<prior>'/`<next>' to vterm.
+`pixel-scroll-precision-mode' is a *minor* mode and its keymap
+shadows `vterm-mode-map' (Emacs gives minor-mode keymaps a higher
+lookup precedence than major-mode keymaps).  Without this override
+PageUp/PageDown would scroll the Emacs buffer instead of being sent
+to the terminal -- programs like `less' or `man' would never see
+them.  We attach this map via `minor-mode-overriding-map-alist' in
+vterm buffers, which restores major-mode-like priority for these
+two keys *only* while pixel-scroll is enabled, leaving wheel-scroll
+behaviour unchanged.")
+
+(defun emacs.d/vterm--install-pixel-scroll-passthrough ()
+  "Send PageUp/PageDown to the terminal even with `pixel-scroll-precision-mode' on.
+Hooked on `vterm-mode-hook' so it runs once per vterm buffer.
+The override is keyed on `pixel-scroll-precision-mode' so it only
+takes effect when that minor mode is active; if you ever turn pixel
+scroll off, the entry becomes inert and ordinary `vterm-mode-map'
+bindings (which already route both keys to `vterm--self-insert')
+take over again."
+  (setq-local minor-mode-overriding-map-alist
+              (cons (cons 'pixel-scroll-precision-mode
+                          emacs.d/vterm--pixel-scroll-passthrough-map)
+                    (assq-delete-all 'pixel-scroll-precision-mode
+                                     minor-mode-overriding-map-alist))))
+
 (with-eval-after-load 'vterm
   (advice-add 'vterm--filter :after #'emacs.d/vterm-update-current-host)
   ;; Bind cross-to-remote commands directly on the keymap rather than
@@ -1675,6 +1705,16 @@ omitted when the host doesn't match anything in
   ;; is reloaded after vterm has already been set up.
   (define-key vterm-mode-map (kbd "C-c f") #'emacs.d/vterm-find-file-remote)
   (define-key vterm-mode-map (kbd "C-c d") #'emacs.d/vterm-dired-remote)
+  ;; Restore PageUp/PageDown passthrough in every new vterm buffer
+  ;; (see `emacs.d/vterm--install-pixel-scroll-passthrough' for the why).
+  ;; Also retro-apply to vterm buffers that already exist when this
+  ;; module is reloaded, so the user does not have to re-open them.
+  (add-hook 'vterm-mode-hook
+            #'emacs.d/vterm--install-pixel-scroll-passthrough)
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (derived-mode-p 'vterm-mode)
+        (emacs.d/vterm--install-pixel-scroll-passthrough))))
   ;; Add the chain indicator to every mode line (the function returns
   ;; nil outside vterm buffers, so it's invisible elsewhere).  Avoid
   ;; double-registration on reload.
