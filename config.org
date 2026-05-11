@@ -1315,17 +1315,33 @@ cdr is a plist with these recognised keys:
                        ssh hop (e.g. \"root\" for a CyberArk-style
                        bastion that auto-runs `RemoteCommand sudo
                        -i').  nil disables the sudo hop entirely.
+
   :bastion-user STRING The user the session is expected to be
                        running as after that sudo (default
                        inherited from `emacs.d/vterm-tramp-bastion-user').
                        An *extra* sudo is added if the prompt's
                        user differs (e.g. after `sudo su - oracle').
 
+  :tramp-alias VALUE   Use this ssh_config alias *for the TRAMP
+                       path only*, instead of the alias used for
+                       the interactive vterm session.  Needed when
+                       the interactive entry has `RemoteCommand'
+                       or `RequestTTY' settings that confuse
+                       TRAMP's prompt detection: keep the original
+                       alias for vterm, declare a clean variant
+                       (no RemoteCommand, no RequestTTY) and
+                       point :tramp-alias at it.  VALUE may be a
+                       string (used verbatim) or a function of one
+                       argument (the bastion alias) returning a
+                       string.
+
 The first matching entry wins; aliases that match no entry use
 the global defaults.  Example:
 
-  \\='((\"\\\\`\\\\(lx\\\\|kx\\\\)sag\" :sudo-user \"root\")
-    (\"\\\\`my-vps\\\\'\"            :sudo-user nil))"
+  \\='((\"\\\\`\\\\(lx\\\\|kx\\\\)sag\"
+     :sudo-user   \"root\"
+     :tramp-alias (lambda (b) (concat b \"-tramp\")))
+    (\"\\\\`my-vps\\\\'\" :sudo-user nil))"
   :type '(alist :key-type regexp :value-type plist)
   :group 'emacs.d)
 
@@ -1370,6 +1386,17 @@ matched entry does not include KEY."
         (plist-get cfg key)
       default)))
 
+(defun emacs.d/vterm--tramp-resolve-alias (bastion)
+  "Return the ssh_config alias TRAMP should use for BASTION.
+Honors a `:tramp-alias' entry in `emacs.d/ssh-host-tramp-config'
+(string used verbatim, or function called with BASTION); falls
+back to BASTION itself."
+  (let ((override (emacs.d/vterm--tramp-resolved bastion :tramp-alias nil)))
+    (cond
+     ((stringp override)   override)
+     ((functionp override) (funcall override bastion))
+     (t                    bastion))))
+
 (defun emacs.d/vterm--tramp-default-directory ()
   "Compose the TRAMP path matching the current session prompt, or nil.
 Builds `/ssh:BASTION[|sudo:U1@BASTION][|ssh:TARGET][|sudo:U2@TARGET]:CWD/'
@@ -1377,18 +1404,22 @@ from the buffer-local state.  Returns nil only when bastion or host
 are still unknown; if cwd has not been captured yet we fall back to
 `~' so the path remains valid and points at the remote home dir.
 
-Per-host sudo behaviour comes from `emacs.d/ssh-host-tramp-config'
-(opt-in alist), with `emacs.d/vterm-tramp-sudo-user' /
-`emacs.d/vterm-tramp-bastion-user' as global defaults.  Each `sudo'
-hop spells out `USER@HOST' explicitly because TRAMP validates that
-a sudo's host matches the host of the previous hop, otherwise
-errors with `host name X does not match Y'."
+Per-host overrides come from `emacs.d/ssh-host-tramp-config' (opt-in
+alist): `:sudo-user' selects the sudo step, `:tramp-alias' picks a
+different ssh_config Host stanza for TRAMP than for the interactive
+session.  Globals `emacs.d/vterm-tramp-sudo-user' /
+`emacs.d/vterm-tramp-bastion-user' apply when an alias matches no
+entry.  Each `sudo' hop spells out `USER@HOST' explicitly because
+TRAMP validates that a sudo's host matches the host of the previous
+hop, otherwise errors with `host name X does not match Y'."
   (let ((bastion emacs.d/vterm-bastion-name)
         (host    emacs.d/vterm-current-host)
         (user    emacs.d/vterm-current-user)
         (path    emacs.d/vterm-current-path))
     (when (and bastion host)
-      (let* ((sudo-user-name
+      (let* ((tramp-alias
+              (emacs.d/vterm--tramp-resolve-alias bastion))
+             (sudo-user-name
               (emacs.d/vterm--tramp-resolved
                bastion :sudo-user emacs.d/vterm-tramp-sudo-user))
              (bastion-user
@@ -1396,7 +1427,7 @@ errors with `host name X does not match Y'."
                bastion :bastion-user emacs.d/vterm-tramp-bastion-user))
              (sudo-on-bastion
               (and sudo-user-name
-                   (format "|sudo:%s@%s" sudo-user-name bastion)))
+                   (format "|sudo:%s@%s" sudo-user-name tramp-alias)))
              (extra-ssh
               (and (not (string-equal host bastion))
                    (format "|ssh:%s" host)))
@@ -1410,7 +1441,7 @@ errors with `host name X does not match Y'."
                    (not (string-equal user bastion-user))
                    (format "|sudo:%s@%s" user host))))
         (format "/ssh:%s%s%s%s:%s"
-                bastion
+                tramp-alias
                 (or sudo-on-bastion "")
                 (or extra-ssh        "")
                 (or extra-sudo       "")
