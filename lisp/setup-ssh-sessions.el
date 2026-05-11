@@ -14,7 +14,9 @@
   "OpenSSH client configuration file used as the source of host aliases."
   :type 'file :group 'emacs.d)
 
-(defcustom emacs.d/ssh-target-bastions nil
+(defcustom emacs.d/ssh-target-bastions
+  '(("\\`lx[a-z]+0[0-9]"     . "lxsag011")
+    ("\\`lx[a-z]+[789][0-9]" . "lxsag811"))
   "Alist mapping target-host regexps to the bastion ssh_config alias
 to route through.  Each entry is `(REGEX . BASTION-ALIAS)' where
 REGEX is matched against the host name (the part after `@' in
@@ -31,9 +33,11 @@ bastion's per-host settings (sudo-user, tramp-alias) come from
 `emacs.d/ssh-host-tramp-config'.  Targets that match no entry use
 plain `ssh' as before.
 
-Example:
-
-  \\='((\"\\\\`lx\\\\(umc\\\\|ohr\\\\|wfm\\\\)\" . \"lxsag811\"))"
+Default value reflects this user's environment: hosts named
+`lxXXX0NN' (digit group starting with 0) are routed through
+`lxsag011', `lxXXX7NN' / `lxXXX8NN' / `lxXXX9NN' through
+`lxsag811'.  Override via `M-x customize-variable' or
+`(setq ...)' for other environments."
   :type '(alist :key-type regexp :value-type string)
   :group 'emacs.d)
 

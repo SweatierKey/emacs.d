@@ -1340,7 +1340,8 @@ su - oracle' on the target).  Per-host override via
 `emacs.d/ssh-host-tramp-config'."
   :type 'string :group 'emacs.d)
 
-(defcustom emacs.d/ssh-host-tramp-config nil
+(defcustom emacs.d/ssh-host-tramp-config
+  '(("\\`lxsag" :sudo-user "root"))
   "Per-host TRAMP overrides matched against ssh_config aliases.
 Alist where each car is a regexp matched (with `string-match-p')
 against the alias passed to `emacs.d/ssh-sessions-open', and each
@@ -1348,8 +1349,8 @@ cdr is a plist with these recognised keys:
 
   :sudo-user STRING    Become this user via sudo right after the
                        ssh hop (e.g. \"root\" for a CyberArk-style
-                       bastion that auto-runs `RemoteCommand sudo
-                       -i').  nil disables the sudo hop entirely.
+                       bastion that auto-elevates).  nil disables
+                       the sudo hop entirely.
 
   :bastion-user STRING The user the session is expected to be
                        running as after that sudo (default
@@ -1359,24 +1360,21 @@ cdr is a plist with these recognised keys:
 
   :tramp-alias VALUE   Use this ssh_config alias *for the TRAMP
                        path only*, instead of the alias used for
-                       the interactive vterm session.  Needed when
-                       the interactive entry has `RemoteCommand'
-                       or `RequestTTY' settings that confuse
-                       TRAMP's prompt detection: keep the original
-                       alias for vterm, declare a clean variant
-                       (no RemoteCommand, no RequestTTY) and
-                       point :tramp-alias at it.  VALUE may be a
-                       string (used verbatim) or a function of one
-                       argument (the bastion alias) returning a
-                       string.
+                       the interactive vterm session.  Only needed
+                       in legacy setups where the interactive
+                       entry must keep `RemoteCommand' /
+                       `RequestTTY' for CLI ssh; with the chain
+                       built in elisp (see `emacs.d/ssh-target-bastions')
+                       a clean ssh_config Host stanza serves both
+                       vterm and TRAMP and this key is unused.
+                       VALUE may be a string (used verbatim) or a
+                       function of one argument (the bastion
+                       alias) returning a string.
 
 The first matching entry wins; aliases that match no entry use
-the global defaults.  Example:
-
-  \\='((\"\\\\`\\\\(lx\\\\|kx\\\\)sag\"
-     :sudo-user   \"root\"
-     :tramp-alias (lambda (b) (concat b \"-tramp\")))
-    (\"\\\\`my-vps\\\\'\" :sudo-user nil))"
+the global defaults.  Default value covers `lxsag*' bastions of
+this user; override via `M-x customize-variable' or
+`(setq ...)' for other environments."
   :type '(alist :key-type regexp :value-type plist)
   :group 'emacs.d)
 
@@ -1775,25 +1773,30 @@ path tracking]] is consulted to find the bastion's elevation
 settings; one source of truth covers both the vterm chain and the
 TRAMP chain.
 
-Example -- two bastions chosen by the host-name *digit group* (the
-first digit after the alpha prefix selects the data-centre / row,
-so `lxumc811' belongs to the 8xx world routed through `lxsag811',
-whereas `lxohr002' is in the 0xx world routed through `lxsag011'):
+Two bastions chosen by the host-name *digit group* are the
+defaults baked into ~emacs.d/ssh-target-bastions~: the first digit
+after the alpha prefix selects the data-centre / row, so
+`lxumc811' belongs to the 8xx world routed through `lxsag811',
+whereas `lxohr002' is in the 0xx world routed through `lxsag011'.
+No manual ~setq~ needed -- the defaults already match this user's
+environment.
 
 #+begin_src emacs-lisp :tangle no
-(setq emacs.d/ssh-host-tramp-config
-      '(("\\`\\(lx\\|kx\\)sag" :sudo-user "root")))
-
-(setq emacs.d/ssh-target-bastions
-      '(("\\`lx[a-z]+0[0-9]"     . "lxsag011")
-        ("\\`lx[a-z]+[789][0-9]" . "lxsag811")))
+;; Built-in defaults (see the defcustom in setup-terminal.el and
+;; setup-ssh-sessions.el).  Override only when working from a
+;; machine with a different bastion topology.
+emacs.d/ssh-host-tramp-config
+  ;; => '(("\\`lxsag" :sudo-user "root"))
+emacs.d/ssh-target-bastions
+  ;; => '(("\\`lx[a-z]+0[0-9]"     . "lxsag011")
+  ;;      ("\\`lx[a-z]+[789][0-9]" . "lxsag811"))
 #+end_src
 
-Then ~C-c s s oracle@lxumc811~ opens a vterm running
-=ssh -t lxsag811 sudo -i -u root ssh -t lxumc811 sudo -i -u oracle=,
-~C-c s s root@lxohr002~ uses =lxsag011= instead, and `C-c f' / `C-c
-d' inside each vterm reach the same file-system view via TRAMP --
-all from one ~setq~ pair.
+So ~C-c s s oracle@lxumc811~ opens a vterm running
+=ssh -t lxsag811 sudo -i -u root ssh -t lxumc811 sudo -i -u oracle=
+straight away, ~C-c s s root@lxohr002~ uses =lxsag011= instead,
+and `C-c f' / `C-c d' inside each vterm reach the same file-system
+view via TRAMP.
 
 ** Bindings
 :PROPERTIES:
@@ -1847,7 +1850,9 @@ Opening a session:
   "OpenSSH client configuration file used as the source of host aliases."
   :type 'file :group 'emacs.d)
 
-(defcustom emacs.d/ssh-target-bastions nil
+(defcustom emacs.d/ssh-target-bastions
+  '(("\\`lx[a-z]+0[0-9]"     . "lxsag011")
+    ("\\`lx[a-z]+[789][0-9]" . "lxsag811"))
   "Alist mapping target-host regexps to the bastion ssh_config alias
 to route through.  Each entry is `(REGEX . BASTION-ALIAS)' where
 REGEX is matched against the host name (the part after `@' in
@@ -1864,9 +1869,11 @@ bastion's per-host settings (sudo-user, tramp-alias) come from
 `emacs.d/ssh-host-tramp-config'.  Targets that match no entry use
 plain `ssh' as before.
 
-Example:
-
-  \\='((\"\\\\`lx\\\\(umc\\\\|ohr\\\\|wfm\\\\)\" . \"lxsag811\"))"
+Default value reflects this user's environment: hosts named
+`lxXXX0NN' (digit group starting with 0) are routed through
+`lxsag011', `lxXXX7NN' / `lxXXX8NN' / `lxXXX9NN' through
+`lxsag811'.  Override via `M-x customize-variable' or
+`(setq ...)' for other environments."
   :type '(alist :key-type regexp :value-type string)
   :group 'emacs.d)
 

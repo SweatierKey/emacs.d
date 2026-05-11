@@ -87,7 +87,8 @@ su - oracle' on the target).  Per-host override via
 `emacs.d/ssh-host-tramp-config'."
   :type 'string :group 'emacs.d)
 
-(defcustom emacs.d/ssh-host-tramp-config nil
+(defcustom emacs.d/ssh-host-tramp-config
+  '(("\\`lxsag" :sudo-user "root"))
   "Per-host TRAMP overrides matched against ssh_config aliases.
 Alist where each car is a regexp matched (with `string-match-p')
 against the alias passed to `emacs.d/ssh-sessions-open', and each
@@ -95,8 +96,8 @@ cdr is a plist with these recognised keys:
 
   :sudo-user STRING    Become this user via sudo right after the
                        ssh hop (e.g. \"root\" for a CyberArk-style
-                       bastion that auto-runs `RemoteCommand sudo
-                       -i').  nil disables the sudo hop entirely.
+                       bastion that auto-elevates).  nil disables
+                       the sudo hop entirely.
 
   :bastion-user STRING The user the session is expected to be
                        running as after that sudo (default
@@ -106,24 +107,21 @@ cdr is a plist with these recognised keys:
 
   :tramp-alias VALUE   Use this ssh_config alias *for the TRAMP
                        path only*, instead of the alias used for
-                       the interactive vterm session.  Needed when
-                       the interactive entry has `RemoteCommand'
-                       or `RequestTTY' settings that confuse
-                       TRAMP's prompt detection: keep the original
-                       alias for vterm, declare a clean variant
-                       (no RemoteCommand, no RequestTTY) and
-                       point :tramp-alias at it.  VALUE may be a
-                       string (used verbatim) or a function of one
-                       argument (the bastion alias) returning a
-                       string.
+                       the interactive vterm session.  Only needed
+                       in legacy setups where the interactive
+                       entry must keep `RemoteCommand' /
+                       `RequestTTY' for CLI ssh; with the chain
+                       built in elisp (see `emacs.d/ssh-target-bastions')
+                       a clean ssh_config Host stanza serves both
+                       vterm and TRAMP and this key is unused.
+                       VALUE may be a string (used verbatim) or a
+                       function of one argument (the bastion
+                       alias) returning a string.
 
 The first matching entry wins; aliases that match no entry use
-the global defaults.  Example:
-
-  \\='((\"\\\\`\\\\(lx\\\\|kx\\\\)sag\"
-     :sudo-user   \"root\"
-     :tramp-alias (lambda (b) (concat b \"-tramp\")))
-    (\"\\\\`my-vps\\\\'\" :sudo-user nil))"
+the global defaults.  Default value covers `lxsag*' bastions of
+this user; override via `M-x customize-variable' or
+`(setq ...)' for other environments."
   :type '(alist :key-type regexp :value-type plist)
   :group 'emacs.d)
 
