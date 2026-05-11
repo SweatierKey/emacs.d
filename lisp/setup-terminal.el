@@ -332,7 +332,15 @@ sends it followed by Return, and records the signature in
 firings on the same prompt are ignored.  No-op when the chain is
 empty, when user/host are still unknown, or when the signature is
 identical to the last responded one (e.g. command echo before the
-shell has rendered the new prompt)."
+shell has rendered the new prompt).
+
+Before sending, leading `sudo -i -u USER' entries whose target USER
+already matches `emacs.d/vterm-current-user' are dropped from the
+queue: this is what makes the stepper compatible with bastions whose
+ssh_config carries `RemoteCommand sudo -i' (the elevated session
+arrives *already* as the sudo target, so our explicit sudo step
+would be a no-op).  Inner `ssh -t' steps are never skipped --
+they're always needed when present."
   (when (and emacs.d/vterm-pending-chain
              emacs.d/vterm-current-host
              emacs.d/vterm-current-user)
@@ -340,9 +348,18 @@ shell has rendered the new prompt)."
                      emacs.d/vterm-current-host)))
       (unless (equal sig emacs.d/vterm--pending-chain-last-sig)
         (setq-local emacs.d/vterm--pending-chain-last-sig sig)
-        (let ((next (pop emacs.d/vterm-pending-chain)))
-          (vterm-send-string next)
-          (vterm-send-return))))))
+        (while (and emacs.d/vterm-pending-chain
+                    (let ((s (car emacs.d/vterm-pending-chain)))
+                      (and (string-match
+                            "\\`sudo -i -u \\(.+\\)\\'" s)
+                           (string-equal
+                            (match-string 1 s)
+                            emacs.d/vterm-current-user))))
+          (pop emacs.d/vterm-pending-chain))
+        (when emacs.d/vterm-pending-chain
+          (let ((next (pop emacs.d/vterm-pending-chain)))
+            (vterm-send-string next)
+            (vterm-send-return)))))))
 
 (defun emacs.d/vterm-update-current-host (&rest _ignored)
   "Refresh user/host/path from the prompt and rename tab + buffer, then

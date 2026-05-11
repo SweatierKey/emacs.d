@@ -1585,7 +1585,15 @@ sends it followed by Return, and records the signature in
 firings on the same prompt are ignored.  No-op when the chain is
 empty, when user/host are still unknown, or when the signature is
 identical to the last responded one (e.g. command echo before the
-shell has rendered the new prompt)."
+shell has rendered the new prompt).
+
+Before sending, leading `sudo -i -u USER' entries whose target USER
+already matches `emacs.d/vterm-current-user' are dropped from the
+queue: this is what makes the stepper compatible with bastions whose
+ssh_config carries `RemoteCommand sudo -i' (the elevated session
+arrives *already* as the sudo target, so our explicit sudo step
+would be a no-op).  Inner `ssh -t' steps are never skipped --
+they're always needed when present."
   (when (and emacs.d/vterm-pending-chain
              emacs.d/vterm-current-host
              emacs.d/vterm-current-user)
@@ -1593,9 +1601,18 @@ shell has rendered the new prompt)."
                      emacs.d/vterm-current-host)))
       (unless (equal sig emacs.d/vterm--pending-chain-last-sig)
         (setq-local emacs.d/vterm--pending-chain-last-sig sig)
-        (let ((next (pop emacs.d/vterm-pending-chain)))
-          (vterm-send-string next)
-          (vterm-send-return))))))
+        (while (and emacs.d/vterm-pending-chain
+                    (let ((s (car emacs.d/vterm-pending-chain)))
+                      (and (string-match
+                            "\\`sudo -i -u \\(.+\\)\\'" s)
+                           (string-equal
+                            (match-string 1 s)
+                            emacs.d/vterm-current-user))))
+          (pop emacs.d/vterm-pending-chain))
+        (when emacs.d/vterm-pending-chain
+          (let ((next (pop emacs.d/vterm-pending-chain)))
+            (vterm-send-string next)
+            (vterm-send-return)))))))
 
 (defun emacs.d/vterm-update-current-host (&rest _ignored)
   "Refresh user/host/path from the prompt and rename tab + buffer, then
@@ -1844,24 +1861,45 @@ list (a brand-new alias, an IP, a Hostname-like string) connects
 through ~ssh~ all the same.  Any ~Host *~ defaults you have set still
 apply.  This makes "try a new host quickly" a one-keystroke flow.
 
-For bastion entries we recommend a *clean* ssh_config stanza -- no
-~RemoteCommand~, no ~RequestTTY~ -- because TRAMP's prompt detection
-hates them.  For vterm sessions specifically, the multi-step chain
-this module synthesises in shell would also collide with a
-~RemoteCommand~ inherited from the config (OpenSSH refuses with
-~Cannot execute command-line and remote command~) -- but the bastion
-hop is built with ~-o RemoteCommand=none~ exactly to neutralise that
-case, so leaving ~RemoteCommand sudo -i~ in your config is no longer
-fatal.  A typical bastion entry looks like:
+For *speed* on PSMP-fronted bastions we recommend keeping
+~RemoteCommand sudo -i~ in the bastion's ssh_config stanza: the
+elevation then happens during the SSH handshake instead of costing
+an extra interactive round-trip after login.  The auto-stepper
+(see `emacs.d/vterm--advance-pending-chain') is idempotent: it
+notices when the queued `sudo -i -u root' step is already
+satisfied by the arriving session (because RemoteCommand has
+elevated us) and silently drops it, so the two layers compose
+cleanly.
+
+The cost: ~RemoteCommand~ confuses TRAMP's prompt detection on the
+*same* alias.  We therefore declare two Host stanzas per bastion --
+an *interactive* alias that carries the RemoteCommand for vterm
+sessions, and a *clean* TRAMP-only alias pointing at the same
+HostName -- and point TRAMP at the latter via the ~:tramp-alias~
+key of `emacs.d/ssh-host-tramp-config'.  Example:
 
 #+begin_src conf-space :tangle no
+# Interactive: fast PSMP-friendly auto-elevation via RemoteCommand
 Host lxsag811 lxsag011 lxsag012
     HostName     psmpcyb.gbm.lan
     User         matteo.aquino@CYB-ADMIN1@%n.gbm.lan
     IdentityFile ~/.ssh/id_acme
     PreferredAuthentications publickey,keyboard-interactive
-    # no RemoteCommand, no RequestTTY -- both vterm and TRAMP friendly
+    RemoteCommand sudo -i
+    RequestTTY    yes
+
+# TRAMP-only: no RemoteCommand, no RequestTTY -- clean for TRAMP
+Host lxsag811-tramp lxsag011-tramp lxsag012-tramp
+    HostName     psmpcyb.gbm.lan
+    User         matteo.aquino@CYB-ADMIN1@%n.gbm.lan
+    IdentityFile ~/.ssh/id_acme
+    PreferredAuthentications publickey,keyboard-interactive
 #+end_src
+
+If you cannot keep ~RemoteCommand~ in your ssh_config (e.g. corporate
+policy forbids it, or you prefer a single Host stanza), simply omit
+it: the stepper falls back to typing ~sudo -i -u root~ interactively
+on the first bastion prompt -- correct, just one round-trip slower.
 
 ** Routing through a bastion (user@host)
 :PROPERTIES:
