@@ -93,9 +93,5 @@
 (require 'setup-completion)
 (require 'setup-prog)
 (require 'setup-magit)
-(require 'setup-tramp)
-(require 'setup-terminal)
-(require 'setup-ssh-sessions)
-(require 'setup-ssh-tunnels)
 
 ;;; init.el ends here

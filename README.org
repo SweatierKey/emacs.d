@@ -21,14 +21,9 @@ prose + code in the same place.
   ~flymake-shellcheck~ as a Bash fallback.
 - *Tree-sitter syntax highlighting* via ~treesit-auto~ -- grammars are
   downloaded on demand.
-- *Magit* for Git, *TRAMP* tuned for SSH, *gcmh* for invisible GC.
-- *Terminal stack*: [[https://github.com/akermu/emacs-libvterm][vterm]] in =tab-bar-mode= tabs, with a /dynamic tab
-  title/ that shows =BASTION: HOST= -- the bastion comes from your saved
-  session and the host is parsed from the remote shell prompt.  Plus a
-  built-in *SSH session manager* and *SSH tunnel manager* with
-  toggleable port forwards.
-- *Backups, auto-saves and TRAMP cache* are funnelled into ~var/~ so the
-  rest of the disk stays clean.
+- *Magit* for Git, *gcmh* for invisible GC.
+- *Backups and auto-saves* are funnelled into ~var/~ so the rest of the
+  disk stays clean.
 
 * Layout
 
@@ -43,12 +38,8 @@ prose + code in the same place.
 │   ├── setup-editor.el      Built-in editing tweaks + auto-tangle hook
 │   ├── setup-completion.el  vertico, marginalia, orderless, consult, corfu
 │   ├── setup-prog.el        eglot, flymake, eldoc, treesit, shellcheck
-│   ├── setup-magit.el        Git porcelain
-│   ├── setup-tramp.el        Remote editing over SSH
-│   ├── setup-terminal.el     vterm + tab-bar + dynamic tab title
-│   ├── setup-ssh-sessions.el Open SSH connections in vterm tabs (uses ~/.ssh/config)
-│   └── setup-ssh-tunnels.el  Tunnel manager (start/stop port forwards)
-├── var/                Generated state: backups, auto-saves, tramp cache
+│   └── setup-magit.el       Git porcelain
+├── var/                Generated state: backups, auto-saves (gitignored)
 ├── elpa/               Installed packages (gitignored)
 └── eln-cache/          Native-comp cache (gitignored)
 #+end_example
