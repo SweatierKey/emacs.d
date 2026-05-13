@@ -1,6 +1,7 @@
 # --- Installed packages and compilation cache ------------------------------
 elpa/
 eln-cache/
+tree-sitter/
 
 # --- Generated state -------------------------------------------------------
 # Backups, auto-saves and TRAMP persistency live under var/.
